@@ -71,15 +71,13 @@ final class G0CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, Sendabl
     }
 }
 
-/// The picker is a UI callback bridge; the audio delegate above is nonisolated.
+/// MainActor owns only UI presentation and a synchronous reference to the
+/// nonisolated SDK observer. Tasks transport value events, never SDK objects.
 @MainActor
-final class G0CaptureProbe: NSObject, @preconcurrency SCContentSharingPickerObserver {
+final class G0CaptureProbe: NSObject {
     private let inbox: G0AudioInbox
     private let identity: SessionIdentity
-    private let output: G0CaptureOutput
-    private var stream: SCStream?
-    private var startTask: Task<Void, Never>?
-    private var active = true
+    private let core: G0CaptureCore
     var onStarted: (() -> Void)?
     var onCancelled: (() -> Void)?
     var onFailure: ((FailureCode) -> Void)?
@@ -87,7 +85,31 @@ final class G0CaptureProbe: NSObject, @preconcurrency SCContentSharingPickerObse
     init(inbox: G0AudioInbox, identity: SessionIdentity) {
         self.inbox = inbox
         self.identity = identity
-        output = G0CaptureOutput(inbox: inbox, identity: identity)
+        core = G0CaptureCore(inbox: inbox, identity: identity)
+        super.init()
+        core.setHandler { [weak self] event in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // Complete SDK lifecycle transitions before filtering UI events;
+                // a cancelled start must still be stopped and release waiters.
+                switch event {
+                case .stopCompleted(let code):
+                    self.core.stopCompleted(code)
+                    return
+                case .startCompleted(let code):
+                    let started = self.core.startCompleted(code)
+                    guard self.inbox.accepts(self.identity) else { return }
+                    if started { self.onStarted?() }
+                    else if code != nil { self.onFailure?(.captureFailed) }
+                case .cancelled:
+                    guard self.inbox.accepts(self.identity) else { return }
+                    self.onCancelled?()
+                case .failed:
+                    guard self.inbox.accepts(self.identity) else { return }
+                    self.onFailure?(.captureFailed)
+                }
+            }
+        }
     }
 
     func present() throws {
@@ -97,56 +119,18 @@ final class G0CaptureProbe: NSObject, @preconcurrency SCContentSharingPickerObse
         configuration.showsMicrophoneControl = false
         configuration.showsCameraControl = false
         picker.defaultConfiguration = configuration
-        picker.add(self)
+        picker.add(core)
         picker.isActive = true
-        picker.present() // Full display, never presentForCurrentApplication().
-    }
-
-    func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {
-        guard active, inbox.accepts(identity) else { return }
-        onCancelled?()
-    }
-
-    func contentSharingPickerStartDidFailWithError(_ error: any Error) {
-        guard active, inbox.accepts(identity) else { return }
-        onFailure?(.captureFailed)
-    }
-
-    func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
-        guard active, inbox.accepts(identity), self.stream == nil else { return }
-        let configuration = SCStreamConfiguration()
-        configuration.capturesAudio = true
-        configuration.excludesCurrentProcessAudio = true
-        configuration.width = 320
-        configuration.height = 180
-        let capture = SCStream(filter: filter, configuration: configuration, delegate: output)
-        self.stream = capture
-        startTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                try capture.addStreamOutput(output, type: .audio, sampleHandlerQueue: DispatchQueue(label: "LiveSubtitle.G0.audio"))
-                try await capture.startCapture()
-                guard active, inbox.accepts(identity), !Task.isCancelled else {
-                    try? await capture.stopCapture()
-                    return
-                }
-                onStarted?()
-            } catch {
-                if active, inbox.accepts(identity), !Task.isCancelled { onFailure?(.captureFailed) }
-            }
-        }
+        picker.present()
     }
 
     func stop() async {
-        active = false
         let picker = SCContentSharingPicker.shared
-        picker.remove(self)
+        picker.remove(core)
         picker.isActive = false
-        startTask?.cancel()
-        await startTask?.value
-        if let stream { try? await stream.stopCapture() }
-        self.stream = nil
-        startTask = nil
+        await withCheckedContinuation { continuation in
+            core.stop { continuation.resume() }
+        }
     }
 }
 #endif

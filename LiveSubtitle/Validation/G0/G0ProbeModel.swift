@@ -4,6 +4,7 @@ import Observation
 import Translation
 import UIKit
 import Darwin
+import OSLog
 
 @MainActor @Observable
 final class G0ProbeModel {
@@ -42,14 +43,25 @@ final class G0ProbeModel {
         preparing = true
         ready = false
         preparationID = UUID()
-        status = "前台准备本地翻译和英文识别资源；请确认系统下载提示"
-        translationConfiguration = TranslationSession.Configuration(source: G0TranslationProbe.source, target: G0TranslationProbe.target)
+        status = "等待系统提供翻译资源准备会话"
+        translationConfiguration = TranslationSession.Configuration(source: G0TranslationProbe.source, target: G0TranslationProbe.target,
+                                                                     preferredStrategy: .lowLatency)
+    }
+
+    func preparationProgress(_ token: UUID?, stage: String) {
+        let accepted = token == preparationID && preparing
+        Logger(subsystem: "com.zhshy7713950.LiveSubtitle", category: "G0Preparation").notice("stage=\(stage, privacy: .public) accepted=\(accepted)")
+        guard token == preparationID, preparing else { return }
+        status = stage
     }
 
     func finishPreparation(_ token: UUID?) async {
         guard token == preparationID, preparing else { return }
         do {
-            let task = Task { try await speech.prepare() }
+            let speech = self.speech
+            let task = Task { [weak self] in try await speech.prepare(progress: { [weak self] stage in
+                await self?.preparationProgress(token, stage: stage)
+            }) }
             preparationTask = task
             let method = try await task.value
             guard token == preparationID, preparing, !Task.isCancelled else { return }
@@ -173,6 +185,7 @@ final class G0ProbeModel {
                 continue
             }
             if await state.expired(job) { failed(token, code: .deadlineExceeded); return }
+            let translationStarted = clock.now()
             let translation = Task { try await G0TranslationProbe.translate(job.text) }
             let timeout = Task { [weak self] in
                 guard let self else { return }
@@ -189,7 +202,7 @@ final class G0ProbeModel {
                 timeout.cancel()
                 guard identity == token, !Task.isCancelled else { return }
                 if await state.expired(job) { failed(token, code: .deadlineExceeded); return }
-                let application = await state.apply(translated, to: job)
+                let application = await state.apply(translated, to: job, startedAt: translationStarted)
                 if application == .expired { failed(token, code: .deadlineExceeded); return }
                 let snapshot = await state.snapshot()
                 guard identity == token else { return }
@@ -206,7 +219,7 @@ final class G0ProbeModel {
 
     private func updatePiP() {
         let visible = rows.suffix(RuntimePolicy.defaultDisplayCount)
-        pip.update(visible.isEmpty ? "等待声音" : visible.map { ($0.translation.isEmpty ? "本地翻译中…" : $0.translation) + "\n" + $0.source }.joined(separator: "\n\n"))
+        pip.update(visible.isEmpty ? "等待声音" : visible.map(\.displayText).joined(separator: "\n\n"))
     }
 
     private func failed(_ token: SessionIdentity, code: FailureCode) {
@@ -281,6 +294,10 @@ final class G0ProbeModel {
                              scheduling.pending, scheduling.maximumPending, scheduling.stale,
                              Double(initialMemory) / 1_048_576, Double(memory) / 1_048_576, Double(peakMemory) / 1_048_576,
                              ProcessInfo.processInfo.thermalState.rawValue, startMethod, pipEvents)
+        if !speech.failure.isEmpty { metricsText += "\n识别故障：" + speech.failure }
+        metricsText += "\n采集 / PCM 时钟偏差峰值：\(speech.maximumClockOffsetFrames) 帧"
+        metricsText += String(format: "\n有效译文耗时最近 %.2f / 峰值 %.2f s · 最近排队 %.2f s",
+                              scheduling.lastTranslationSeconds, scheduling.maximumTranslationSeconds, scheduling.lastQueueSeconds)
     }
 
     private static func memoryBytes() -> UInt64 {

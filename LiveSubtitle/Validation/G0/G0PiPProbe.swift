@@ -15,6 +15,8 @@ final class G0PiPProbe: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate
     private var origin = 0.0
     private var restoring = false
     private var lines = "等待声音"
+    private var renderedLines = ""
+    private var lastRenderUptime = 0.0
     private(set) var frames = 0
     private(set) var started = false
     var onEvent: ((UUID, String) -> Void)?
@@ -44,8 +46,11 @@ final class G0PiPProbe: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate
         try render()
         renderTask = Task { [weak self] in
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+                do { try await Task.sleep(for: .milliseconds(1_000 / RuntimePolicy.maximumRenderFPS)) } catch { return }
                 guard let self, self.sessionID == sessionID else { return }
+                // New text appears at the policy cadence; unchanged text only
+                // needs a one-second heartbeat, avoiding constant frame work.
+                guard self.lines != self.renderedLines || ProcessInfo.processInfo.systemUptime - self.lastRenderUptime >= 1 else { continue }
                 do { try self.render() } catch { self.onEvent?(sessionID, "renderFailed"); return }
             }
         }
@@ -82,7 +87,10 @@ final class G0PiPProbe: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate
         guard let receiver else { throw FailureCode.pipFailed }
         let time = CMTime(seconds: ProcessInfo.processInfo.systemUptime - origin, preferredTimescale: 600)
         switch receiver.enqueueImmediately(try Self.makeFrame(text: lines, time: time)) {
-        case .enqueued: frames += 1
+        case .enqueued:
+            frames += 1
+            renderedLines = lines
+            lastRenderUptime = ProcessInfo.processInfo.systemUptime
         default: throw FailureCode.pipFailed
         }
     }
@@ -125,7 +133,7 @@ final class G0PiPProbe: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate
                                                             formatDescriptionOut: &description) == noErr, let description else {
             throw FailureCode.pipFailed
         }
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 1),
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: CMTimeScale(RuntimePolicy.maximumRenderFPS)),
                                         presentationTimeStamp: time,
                                         decodeTimeStamp: .invalid)
         var sample: CMSampleBuffer?

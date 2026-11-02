@@ -1,6 +1,7 @@
 #if DEBUG && !targetEnvironment(simulator)
 import AVFoundation
 import Speech
+import OSLog
 
 struct G0SpeechMetrics: Sendable {
     var consumed = 0
@@ -11,6 +12,8 @@ struct G0SpeechMetrics: Sendable {
     var analyzerRate = 0.0
     var channels = 0
     var discontinuities = 0
+    var failure = ""
+    var maximumClockOffsetFrames: Int64 = 0
 }
 
 /// SDK objects and conversion stay inside this actor. G0 only, not SpeechServicing.
@@ -26,27 +29,31 @@ actor G0SpeechProbe {
     private var heldSeconds = 0.0
     private var firstPTS: Double?
     private var previousEnd: Double?
+    private var audioTiming = G0AudioTiming()
     private var failureCallback: (@Sendable (SessionIdentity, FailureCode) async -> Void)?
     private var resultTask: Task<Void, Never>?
     private var identity: SessionIdentity?
     private var metrics = G0SpeechMetrics()
+    private var inputStage = "idle"
+    private var lastInputEnd: CMTime?
 
-    func prepare() async throws -> String {
-        do { return try await prepareResources() }
+    func prepare(progress: @escaping @Sendable (String) async -> Void) async throws -> String {
+        do { return try await prepareResources(progress: progress) }
         catch {
             await release() // Cleanup is part of the tracked preparation task.
             throw error
         }
     }
 
-    private func prepareResources() async throws -> String {
+    private func prepareResources(progress: @Sendable (String) async -> Void) async throws -> String {
         try Task.checkCancellation()
+        await progress("识别：正在检查英文识别能力与语种")
         let requested = Locale(identifier: "en-US")
         if SpeechTranscriber.isAvailable,
            let locale = await SpeechTranscriber.supportedLocale(equivalentTo: requested) {
             transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [],
                                             reportingOptions: [.volatileResults], attributeOptions: [.audioTimeRange])
-            try await install(locale: locale)
+            try await install(locale: locale, progress: progress)
             return "SpeechTranscriber"
         }
         guard let locale = await DictationTranscriber.supportedLocale(equivalentTo: requested) else {
@@ -54,7 +61,7 @@ actor G0SpeechProbe {
         }
         dictation = DictationTranscriber(locale: locale, contentHints: [], transcriptionOptions: [],
                                          reportingOptions: [.volatileResults], attributeOptions: [.audioTimeRange])
-        try await install(locale: locale)
+        try await install(locale: locale, progress: progress)
         return "DictationTranscriber"
     }
 
@@ -64,16 +71,20 @@ actor G0SpeechProbe {
         return []
     }
 
-    private func install(locale: Locale) async throws {
+    private func install(locale: Locale, progress: @Sendable (String) async -> Void) async throws {
+        await progress("识别：正在预留英文模型资源")
         let existing = await AssetInventory.reservedLocales
         ownsReservation = !existing.contains(locale)
         if ownsReservation { _ = try await AssetInventory.reserve(locale: locale) }
         reservedLocale = locale
         try Task.checkCancellation()
+        await progress("识别：正在查询模型安装请求")
         if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
+            await progress("识别：正在下载 / 安装英文模型，请保持前台联网")
             try await request.downloadAndInstall()
         }
         try Task.checkCancellation()
+        await progress("识别：正在核对安装状态与输入格式")
         guard await AssetInventory.status(forModules: modules) == .installed,
               let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules) else {
             throw FailureCode.assetsMissing
@@ -95,6 +106,8 @@ actor G0SpeechProbe {
         heldSeconds = 0
         firstPTS = nil
         previousEnd = nil
+        audioTiming = G0AudioTiming()
+        lastInputEnd = nil
         failureCallback = onFailure
         try await analyzer.prepareToAnalyze(in: format)
         try Task.checkCancellation()
@@ -107,9 +120,15 @@ actor G0SpeechProbe {
                         guard let self, await self.isCurrent(identity), !Task.isCancelled else { return }
                         try await self.publish(identity, range: result.range, text: result.text, final: result.isFinal, callback: onTranscript)
                     }
-                    if let self, await self.isCurrent(identity), !Task.isCancelled { await onFailure(identity, .speechFailed) }
+                    if let self, await self.isCurrent(identity), !Task.isCancelled {
+                        Logger(subsystem: "com.zhshy7713950.LiveSubtitle", category: "G0Speech").error("speech_stage=results_ended")
+                        await onFailure(identity, .speechFailed)
+                    }
                 } catch {
-                    if let self, await self.isCurrent(identity), !Task.isCancelled { await onFailure(identity, .speechFailed) }
+                    if let self, await self.isCurrent(identity), !Task.isCancelled {
+                        await self.recordFailure(error, stage: "results")
+                        await onFailure(identity, .speechFailed)
+                    }
                 }
             }
         } else if let dictation {
@@ -129,7 +148,7 @@ actor G0SpeechProbe {
 
     func nextInput(identity token: SessionIdentity, inbox: G0AudioInbox) async throws -> AnalyzerInput? {
         guard identity == token, !Task.isCancelled else { return nil }
-        if !converted.isEmpty { return converted.removeFirst() }
+        if !converted.isEmpty { return popConverted() }
         if heldSeconds > 0 {
             inbox.consumed(token, seconds: heldSeconds)
             heldSeconds = 0
@@ -152,11 +171,12 @@ actor G0SpeechProbe {
                 previousEnd = pts + duration
                 try await consume(packet.chunk, relativePTS: pts - (firstPTS ?? pts))
                 guard identity == token, !Task.isCancelled else { return nil }
-                if !converted.isEmpty { return converted.removeFirst() }
+                if !converted.isEmpty { return popConverted() }
             }
             return nil
         } catch {
             if identity == token, !Task.isCancelled {
+                recordFailure(error, stage: inputStage)
                 await failureCallback?(token, (error as? FailureCode) ?? .speechFailed)
             }
             throw error
@@ -164,6 +184,31 @@ actor G0SpeechProbe {
     }
 
     private func isCurrent(_ token: SessionIdentity) -> Bool { identity == token }
+
+    private func popConverted() -> AnalyzerInput {
+        let input = converted.removeFirst()
+        if let start = input.bufferStartTime {
+            let overlap = lastInputEnd.map { CMTimeCompare(start, $0) < 0 } ?? false
+            if metrics.consumed <= 8 || overlap {
+                let previous = lastInputEnd ?? .zero
+                Logger(subsystem: "com.zhshy7713950.LiveSubtitle", category: "G0Speech").notice("speech_stage=input_time start=\(start.value)/\(start.timescale) duration=\(input.bufferDuration.value)/\(input.bufferDuration.timescale) previous_end=\(previous.value)/\(previous.timescale) overlap=\(overlap) rate=\(input.bufferFormat.sampleRate) channels=\(input.bufferFormat.channelCount)")
+            }
+            lastInputEnd = CMTimeAdd(start, input.bufferDuration)
+        }
+        return input
+    }
+
+    private func recordFailure(_ error: any Error, stage: String) {
+        let native = error as NSError
+        // Error-domain identifiers and numeric codes are metadata; never log
+        // localizedDescription, userInfo, audio, or recognition output.
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+        let domain = native.domain.count <= 128 && native.domain.unicodeScalars.allSatisfy(allowed.contains) ? native.domain : "other"
+        let audioSystem = native.domain == SFSpeechErrorDomain && native.code == SFSpeechError.Code.cannotConfigureAudioSystem.rawValue
+        metrics.failure = "\(stage): \(domain)#\(native.code) audioSystem=\(audioSystem)"
+        let diagnostic = metrics.failure
+        Logger(subsystem: "com.zhshy7713950.LiveSubtitle", category: "G0Speech").error("speech_stage=\(diagnostic, privacy: .public)")
+    }
 
     private func publish(_ token: SessionIdentity, range: CMTimeRange, text: AttributedString, final: Bool,
                          callback: @Sendable (G0Transcript) async -> Void) async throws {
@@ -173,10 +218,12 @@ actor G0SpeechProbe {
         guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         metrics.results += 1
         let key = CMTimeConvertScale(range.start, timescale: 1_000, method: .default).value
-        await callback(G0Transcript(identity: token, key: key, text: source, isFinal: final))
+        let end = CMTimeConvertScale(CMTimeRangeGetEnd(range), timescale: 1_000, method: .default).value
+        await callback(G0Transcript(identity: token, key: key, text: source, isFinal: final, end: end))
     }
 
     private func consume(_ chunk: AudioChunk, relativePTS: Double) async throws {
+        inputStage = "pcm_format"
         guard let converter else { throw FailureCode.speechFailed }
         let common: AVAudioCommonFormat
         switch chunk.format.sampleFormat {
@@ -193,6 +240,7 @@ actor G0SpeechProbe {
         }
         buffer.frameLength = AVAudioFrameCount(chunk.frameCount)
         let planes = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        inputStage = "pcm_ownership"
         guard planes.count == chunk.ownedPCM.count else { throw FailureCode.speechFailed }
         var peak = 0.0
         for (index, plane) in planes.enumerated() {
@@ -217,8 +265,16 @@ actor G0SpeechProbe {
         if peak > 0.0001 { metrics.nonSilent += 1 }
         metrics.inputRate = chunk.sampleRate
         metrics.channels = chunk.channels
-        let time = AVAudioTime(sampleTime: AVAudioFramePosition(relativePTS * chunk.sampleRate), atRate: chunk.sampleRate)
+        inputStage = "sample_clock"
+        let position = try audioTiming.framePosition(for: chunk.capturePTS, frameCount: chunk.frameCount, sampleRate: chunk.sampleRate)
+        metrics.maximumClockOffsetFrames = audioTiming.maximumClockOffsetFrames
+        if metrics.consumed <= 8 {
+            Logger(subsystem: "com.zhshy7713950.LiveSubtitle", category: "G0Speech").notice("speech_stage=capture_time sequence=\(chunk.sequence) frames=\(chunk.frameCount) sample_position=\(position) capture_position=\(self.audioTiming.captureFramePosition) rate=\(chunk.sampleRate)")
+        }
+        let time = AVAudioTime(sampleTime: position, atRate: chunk.sampleRate)
+        inputStage = "conversion"
         converted = try converter.convert(buffer, at: time)
+        inputStage = "analysis_window"
         // Explicitly trim old analysis audio; never retain an unbounded transcript window.
         if relativePTS > Double(RuntimePolicy.transcriptWindowDuration.components.seconds) {
             await analyzer?.cancelAnalysis(before: CMTime(seconds: relativePTS - Double(RuntimePolicy.transcriptWindowDuration.components.seconds), preferredTimescale: 1_000))

@@ -31,7 +31,7 @@ struct G0ProbeView: View {
                 Text("音频、画面、字幕只在内存中；不使用麦克风、不上传。资源准备可能由系统下载模型。测试时只播放无敏感内容。").font(.caption).foregroundStyle(.secondary)
                 ForEach(model.rows) { row in
                     VStack(alignment: .leading) {
-                        Text(row.translation.isEmpty ? "本地翻译中…" : row.translation).font(.headline)
+                        if !row.translation.isEmpty { Text(row.translation).font(.headline) }
                         Text(row.source).foregroundStyle(.secondary)
                     }
                 }
@@ -41,6 +41,7 @@ struct G0ProbeView: View {
         }
         .translationTask(model.translationConfiguration, action: G0TranslationProbe.preparationAction(
             token: model.preparationID,
+            progress: { await model.preparationProgress($0, stage: $1) },
             completed: { await model.finishPreparation($0) },
             failed: { await model.preparationFailed($0) }
         ))
