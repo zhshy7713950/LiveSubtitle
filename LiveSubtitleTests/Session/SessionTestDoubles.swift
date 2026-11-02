@@ -106,15 +106,28 @@ final class FakeAudioSource: AudioSource {
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var configurations: [CaptureConfig] = []
+    private var shouldSuspendStart = false
+    private var startContinuation: CheckedContinuation<Void, Never>?
 
     func start(config: CaptureConfig) async throws -> AsyncStream<AudioSourceEvent> {
         startCount += 1
         configurations.append(config)
         if cancelStart { throw CancellationError() }
+        if shouldSuspendStart {
+            shouldSuspendStart = false
+            await withCheckedContinuation { continuation in
+                startContinuation = continuation
+            }
+        }
         return AsyncStream(bufferingPolicy: .bufferingOldest(64)) { _ in }
     }
 
     func stop() async { stopCount += 1 }
+    func suspendNextStart() { shouldSuspendStart = true }
+    func releaseStart() {
+        startContinuation?.resume()
+        startContinuation = nil
+    }
 }
 
 actor FakeAudioProcessing: AudioProcessing {
@@ -185,6 +198,7 @@ actor FakeTranslationScheduling: TranslationScheduling {
     private var stopContinuation: CheckedContinuation<Void, Never>?
     private var shouldSuspendSetMode = false
     private var shouldSuspendStop = false
+    private var setModeError: Error?
 
     func start(identity: SessionIdentity, config: SessionConfig, profile: CloudProfile?) async throws -> AsyncStream<SchedulingEvent> {
         startIdentities.append(identity)
@@ -197,6 +211,7 @@ actor FakeTranslationScheduling: TranslationScheduling {
 
     func setMode(_ mode: EffectiveMode, identity: SessionIdentity, config: SessionConfig, profile: CloudProfile?) async throws {
         modeCalls.append(SchedulerModeCall(mode: mode, identity: identity, profile: profile))
+        if let setModeError { throw setModeError }
         if shouldSuspendSetMode {
             await withCheckedContinuation { continuation in
                 setModeContinuation = continuation
@@ -215,6 +230,7 @@ actor FakeTranslationScheduling: TranslationScheduling {
 
     func emit(_ event: SchedulingEvent, at index: Int = 0) { events.emit(event, at: index) }
     func suspendSetMode() { shouldSuspendSetMode = true }
+    func throwSetMode(_ error: Error) { setModeError = error }
     func releaseSetMode() {
         shouldSuspendSetMode = false
         setModeContinuation?.resume()
@@ -238,6 +254,10 @@ actor FakeCaptionStoring: CaptionStoring {
     private(set) var clearCount = 0
     private var snapshotContinuation: CheckedContinuation<Void, Never>?
     private var shouldSuspendSnapshot = false
+    private var upsertContinuation: CheckedContinuation<Void, Never>?
+    private var shouldSuspendUpsert = false
+    private var releaseUpsertOnClear = false
+    private(set) var upsertCount = 0
 
     func begin(identity: SessionIdentity, display: DisplayPreferences) async {
         self.identity = identity
@@ -250,6 +270,13 @@ actor FakeCaptionStoring: CaptionStoring {
     }
 
     func upsert(_ segment: CaptionSegment) async {
+        upsertCount += 1
+        if shouldSuspendUpsert {
+            shouldSuspendUpsert = false
+            await withCheckedContinuation { continuation in
+                upsertContinuation = continuation
+            }
+        }
         if segments[segment.segmentID] == nil { order.append(segment.segmentID) }
         segments[segment.segmentID] = segment
         while order.count > RuntimePolicy.retainedSegmentLimit {
@@ -282,11 +309,23 @@ actor FakeCaptionStoring: CaptionStoring {
     }
 
     func clear() async {
+        if releaseUpsertOnClear {
+            upsertContinuation?.resume()
+            upsertContinuation = nil
+        }
         segments.removeAll()
         order.removeAll()
         clearCount += 1
     }
 
+    func suspendNextUpsert(releaseOnClear: Bool = false) {
+        shouldSuspendUpsert = true
+        releaseUpsertOnClear = releaseOnClear
+    }
+    func releaseUpsert() {
+        upsertContinuation?.resume()
+        upsertContinuation = nil
+    }
     func suspendSnapshot() { shouldSuspendSnapshot = true }
     func releaseSnapshot() {
         shouldSuspendSnapshot = false
@@ -321,17 +360,35 @@ final class FakePiPControlling: PiPControlling {
 actor FakePreferencesStoring: PreferencesStoring {
     private var storedProfiles: [CloudProfile]
     private(set) var savedProfiles: [CloudProfile] = []
+    private(set) var profileLoadCount = 0
+    private var shouldSuspendProfileLoads = false
+    private var profileContinuations: [CheckedContinuation<Void, Never>] = []
 
     init(profiles: [CloudProfile]) { storedProfiles = profiles }
     func load() async throws -> AppPreferences? { nil }
     func save(_ preferences: AppPreferences) async throws {}
-    func profiles() async throws -> [CloudProfile] { storedProfiles }
+    func profiles() async throws -> [CloudProfile] {
+        profileLoadCount += 1
+        if shouldSuspendProfileLoads {
+            await withCheckedContinuation { continuation in
+                profileContinuations.append(continuation)
+            }
+        }
+        return storedProfiles
+    }
     func saveProfile(_ profile: CloudProfile) async throws {
         savedProfiles.append(profile)
         storedProfiles.removeAll { $0.id == profile.id }
         storedProfiles.append(profile)
     }
     func deleteProfile(id: UUID) async throws { storedProfiles.removeAll { $0.id == id } }
+    func suspendProfileLoads() { shouldSuspendProfileLoads = true }
+    func allowNewProfileLoads() { shouldSuspendProfileLoads = false }
+    func releaseProfileLoads() {
+        shouldSuspendProfileLoads = false
+        profileContinuations.forEach { $0.resume() }
+        profileContinuations.removeAll()
+    }
 }
 
 actor FakeConnectionTesting: ConnectionTesting {

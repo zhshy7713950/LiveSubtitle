@@ -21,6 +21,8 @@ actor SessionCoordinator: SessionCoordinating {
     private var acceptsEvents = false
     private var preparationGeneration: UInt64 = 0
     private var connectionTestGeneration: UInt64 = 0
+    private var startupGeneration: UInt64 = 0
+    private var operationGeneration: UInt64 = 0
     private var restoringSessionIDs: Set<UUID> = []
     private var statusContinuations: [UUID: AsyncStream<SessionStatus>.Continuation] = [:]
     private var consumerTasks: [UUID: Task<Void, Never>] = [:]
@@ -59,6 +61,8 @@ actor SessionCoordinator: SessionCoordinating {
     }
 
     func prepare(config newConfig: SessionConfig) async {
+        if let stopTask { await stopTask.value }
+        operationGeneration += 1
         let languageChanged = config.map {
             $0.sourceLanguage != newConfig.sourceLanguage || $0.targetLanguage != newConfig.targetLanguage
         } ?? false
@@ -134,45 +138,18 @@ actor SessionCoordinator: SessionCoordinating {
 
     func start() async {
         guard phase == .ready, startupTask == nil, stopTask == nil, let config else { return }
-        let profile: CloudProfile?
-        do {
-            profile = try await loadCloudProfile(for: config)
-        } catch let code as FailureCode {
-            phase = .failed
-            failure = code
-            publishStatus()
-            return
-        } catch {
-            phase = .failed
-            failure = .invalidConfiguration
-            publishStatus()
-            return
-        }
-
-        let activeProfile = config.requestedMode == .ai ? profile : nil
-        let sessionIdentity = SessionIdentity(
-            sessionID: UUID(),
-            languageEpoch: languageEpoch,
-            engineEpoch: engineEpoch,
-            cloudConfigRevision: cloudConfigRevision
-        )
-        identity = sessionIdentity
-        cloudProfile = activeProfile
-        requestedMode = config.requestedMode
-        effectiveMode = config.requestedMode == .ai ? .ai : .local
-        failure = nil
-        terminalFailure = nil
-        acceptsEvents = true
+        startupGeneration += 1
+        operationGeneration += 1
+        let generation = startupGeneration
         startOutcome = nil
-        phase = .requestingCapture
+        phase = .starting
         publishStatus()
-
-        let task = Task { await self.performStart(identity: sessionIdentity, config: config, profile: activeProfile) }
+        let task = Task { await self.performStart(generation: generation, config: config) }
         startupTask = task
         await task.value
         startupTask = nil
 
-        guard let outcome = startOutcome, stopTask == nil, isCurrent(sessionIdentity) else { return }
+        guard let outcome = startOutcome, stopTask == nil, startupGeneration == generation else { return }
         startOutcome = nil
         switch outcome {
         case .pickerCancelled:
@@ -184,7 +161,13 @@ actor SessionCoordinator: SessionCoordinating {
             publishStatus()
         case .failed(let code):
             failure = code
-            await stop(reason: .componentFailure)
+            if identity == nil {
+                terminalFailure = code
+                phase = .failed
+                publishStatus()
+            } else {
+                await stop(reason: .componentFailure)
+            }
         }
     }
 
@@ -212,12 +195,14 @@ actor SessionCoordinator: SessionCoordinating {
             await restoreAI()
             return
         }
-        guard var newConfig = config else { return }
+        guard phase == .running, acceptsEvents, let boundIdentity = identity, var newConfig = config else { return }
+        let operation = reserveOperation()
         let profile: CloudProfile?
         if mode == .ai {
             do {
                 profile = try await loadCloudProfile(for: newConfig)
             } catch {
+                guard isOperationCurrent(boundIdentity, operation: operation) else { return }
                 failure = .invalidConfiguration
                 publishStatus()
                 return
@@ -225,71 +210,79 @@ actor SessionCoordinator: SessionCoordinating {
         } else {
             profile = nil
         }
+        guard isOperationCurrent(boundIdentity, operation: operation) else { return }
         newConfig = replacingMode(in: newConfig, mode: mode)
         config = newConfig
         requestedMode = mode
         cloudProfile = profile
+        failure = nil
         if mode == .ai, let profile { cloudConfigRevision = profile.revision }
-        guard acceptsEvents, identity != nil else {
-            effectiveMode = .local
-            publishStatus()
-            return
-        }
-        await changeMode(mode == .ai ? .ai : .local, config: newConfig, profile: profile, advanceEngine: true)
+        await changeMode(
+            mode == .ai ? .ai : .local,
+            config: newConfig,
+            profile: profile,
+            advanceEngine: true,
+            operation: operation
+        )
     }
 
     func cloudProfileWillChange() async {
+        guard phase == .running, acceptsEvents, let boundIdentity = identity, let config else { return }
+        let operation = reserveOperation()
         connectionTestGeneration += 1
         await dependencies.connectionTester.cancel()
+        guard isOperationCurrent(boundIdentity, operation: operation) else { return }
         cloudConfigRevision += 1
         cloudProfile = nil
-        guard acceptsEvents, identity != nil, let config else {
-            publishStatus()
-            return
-        }
         let suspendAI = effectiveMode == .ai || effectiveMode == .localFallback
-        await changeMode(.local, config: config, profile: nil, advanceEngine: suspendAI)
+        await changeMode(.local, config: config, profile: nil, advanceEngine: suspendAI, operation: operation)
     }
 
     func cloudProfileDidChange() async {
-        guard var config else { return }
+        guard phase == .running, acceptsEvents, let boundIdentity = identity, var newConfig = config else { return }
+        let operation = reserveOperation()
         let storedPreferences = try? await dependencies.preferences.load()
-        let selectedID = storedPreferences?.selectedCloudProfileID ?? config.cloudProfileID
-        config = SessionConfig(
-            sourceLanguage: config.sourceLanguage,
-            targetLanguage: config.targetLanguage,
-            requestedMode: config.requestedMode,
+        guard isOperationCurrent(boundIdentity, operation: operation) else { return }
+        let selectedID = storedPreferences?.selectedCloudProfileID ?? newConfig.cloudProfileID
+        newConfig = SessionConfig(
+            sourceLanguage: newConfig.sourceLanguage,
+            targetLanguage: newConfig.targetLanguage,
+            requestedMode: newConfig.requestedMode,
             cloudProfileID: selectedID,
-            displayCount: config.displayCount,
-            displayStyle: config.displayStyle
+            displayCount: newConfig.displayCount,
+            displayStyle: newConfig.displayStyle
         )
-        self.config = config
+        let profile: CloudProfile?
         do {
-            cloudProfile = try await loadCloudProfile(for: config, required: false)
-            if let cloudProfile { cloudConfigRevision = cloudProfile.revision }
+            profile = try await loadCloudProfile(for: newConfig, required: false)
         } catch {
+            guard isOperationCurrent(boundIdentity, operation: operation) else { return }
             cloudProfile = nil
             failure = .invalidConfiguration
-        }
-        guard acceptsEvents, identity != nil else {
-            effectiveMode = .local
             publishStatus()
             return
         }
-        await changeMode(.local, config: config, profile: nil, advanceEngine: false)
+        guard isOperationCurrent(boundIdentity, operation: operation) else { return }
+        config = newConfig
+        cloudProfile = profile
+        if let profile { cloudConfigRevision = profile.revision }
+        await changeMode(.local, config: newConfig, profile: nil, advanceEngine: false, operation: operation)
     }
 
     func restoreAI() async {
-        guard acceptsEvents, let boundIdentity = identity, let config,
+        guard phase == .running, acceptsEvents, let boundIdentity = identity, let config,
               requestedMode == .ai, effectiveMode == .localFallback else { return }
+        let operation = reserveOperation()
         let profile: CloudProfile?
         do {
             profile = try await loadCloudProfile(for: config)
         } catch {
+            guard isOperationCurrent(boundIdentity, operation: operation) else { return }
             failure = .invalidConfiguration
             publishStatus()
             return
         }
+        guard isOperationCurrent(boundIdentity, operation: operation) else { return }
         guard let profile, profile.revision == boundIdentity.cloudConfigRevision else {
             failure = .invalidConfiguration
             publishStatus()
@@ -298,48 +291,68 @@ actor SessionCoordinator: SessionCoordinating {
         connectionTestGeneration += 1
         let generation = connectionTestGeneration
         let result = await dependencies.connectionTester.test(profile: profile)
-        guard generation == connectionTestGeneration, isCurrent(boundIdentity),
+        guard generation == connectionTestGeneration, isOperationCurrent(boundIdentity, operation: operation),
               effectiveMode == .localFallback else { return }
         switch result {
         case .success:
             failure = nil
             cloudProfile = profile
-            await changeMode(.ai, config: config, profile: profile, advanceEngine: true)
+            await changeMode(.ai, config: config, profile: profile, advanceEngine: true, operation: operation)
         case .failure(let code):
             failure = code
             publishStatus()
         }
     }
 
-    private func performStart(identity: SessionIdentity, config: SessionConfig, profile: CloudProfile?) async {
+    private func performStart(generation: UInt64, config: SessionConfig) async {
         do {
-            let source = try await dependencies.mainActor.startAudio(
-                config: CaptureConfig(identity: identity, sourceLanguage: config.sourceLanguage)
+            let loadedProfile = try await loadCloudProfile(for: config)
+            guard isStartCurrent(generation) else { return }
+            let activeProfile = config.requestedMode == .ai ? loadedProfile : nil
+            if let activeProfile { cloudConfigRevision = activeProfile.revision }
+            let sessionIdentity = SessionIdentity(
+                sessionID: UUID(),
+                languageEpoch: languageEpoch,
+                engineEpoch: engineEpoch,
+                cloudConfigRevision: cloudConfigRevision
             )
-            guard isCurrent(identity) else { return }
+            identity = sessionIdentity
+            cloudProfile = activeProfile
+            requestedMode = config.requestedMode
+            effectiveMode = config.requestedMode == .ai ? .ai : .local
+            failure = nil
+            terminalFailure = nil
+            acceptsEvents = true
+            phase = .requestingCapture
+            publishStatus()
+
+            let source = try await dependencies.mainActor.startAudio(
+                config: CaptureConfig(identity: sessionIdentity, sourceLanguage: config.sourceLanguage)
+            )
+            guard isCurrent(sessionIdentity) else { return }
             let format = try await dependencies.speech.inputFormat(source: config.sourceLanguage)
             let processed = await dependencies.audioProcessing.process(source, target: format)
             let speechEvents = try await dependencies.speech.start(input: processed, source: config.sourceLanguage)
-            guard isCurrent(identity) else { return }
+            guard isCurrent(sessionIdentity) else { return }
 
             let relay = AsyncStream<SpeechEvent>.makeStream(bufferingPolicy: .bufferingOldest(64))
             speechRelayContinuation = relay.continuation
             let segmentEvents = await dependencies.segmenter.start(input: relay.stream)
             let schedulingEvents = try await dependencies.scheduler.start(
-                identity: identity,
+                identity: sessionIdentity,
                 config: config,
-                profile: profile
+                profile: activeProfile
             )
             await dependencies.captions.begin(
-                identity: identity,
+                identity: sessionIdentity,
                 display: DisplayPreferences(displayCount: config.displayCount, displayStyle: config.displayStyle)
             )
-            guard isCurrent(identity) else { return }
-            let pipEvents = try await dependencies.mainActor.startPiP(sessionID: identity.sessionID)
-            guard isCurrent(identity) else { return }
+            guard isCurrent(sessionIdentity) else { return }
+            let pipEvents = try await dependencies.mainActor.startPiP(sessionID: sessionIdentity.sessionID)
+            guard isCurrent(sessionIdentity) else { return }
 
             registerConsumers(
-                identity: identity,
+                identity: sessionIdentity,
                 speech: speechEvents,
                 segments: segmentEvents,
                 scheduling: schedulingEvents,
@@ -349,11 +362,11 @@ actor SessionCoordinator: SessionCoordinating {
             publishStatus()
             await refreshCaptions(status: .waitingForAudio)
         } catch is CancellationError {
-            if isCurrent(identity) { startOutcome = .pickerCancelled }
+            if isStartCurrent(generation) { startOutcome = .pickerCancelled }
         } catch let code as FailureCode {
-            if isCurrent(identity) { startOutcome = .failed(code) }
+            if isStartCurrent(generation) { startOutcome = .failed(code) }
         } catch {
-            if isCurrent(identity) { startOutcome = .failed(.captureFailed) }
+            if isStartCurrent(generation) { startOutcome = .failed(.captureFailed) }
         }
     }
 
@@ -464,9 +477,10 @@ actor SessionCoordinator: SessionCoordinating {
     }
 
     private func receiveFallback(eventIdentity: SessionIdentity, reason: FailureCode) async {
-        guard isCurrent(eventIdentity), effectiveMode == .ai, let config else { return }
+        guard phase == .running, isCurrent(eventIdentity), effectiveMode == .ai, let config else { return }
+        let operation = reserveOperation()
         failure = reason
-        await changeMode(.localFallback, config: config, profile: nil, advanceEngine: true)
+        await changeMode(.localFallback, config: config, profile: nil, advanceEngine: true, operation: operation)
     }
 
     private func receiveSchedulerFailure(job: TranslationJob, reason: FailureCode, eventIdentity: SessionIdentity) async {
@@ -526,9 +540,10 @@ actor SessionCoordinator: SessionCoordinating {
         _ mode: EffectiveMode,
         config: SessionConfig,
         profile: CloudProfile?,
-        advanceEngine: Bool
+        advanceEngine: Bool,
+        operation: UInt64
     ) async {
-        guard acceptsEvents, let oldIdentity = identity else { return }
+        guard let oldIdentity = identity, isOperationCurrent(oldIdentity, operation: operation) else { return }
         let mutation = UUID()
         schedulerMutation = mutation
         if advanceEngine { engineEpoch += 1 }
@@ -545,23 +560,24 @@ actor SessionCoordinator: SessionCoordinating {
         publishStatus()
         do {
             try await dependencies.scheduler.setMode(mode, identity: newIdentity, config: config, profile: profile)
-            guard isCurrent(newIdentity), schedulerMutation == mutation else { return }
+            guard isOperationCurrent(newIdentity, operation: operation), schedulerMutation == mutation else { return }
             await dependencies.captions.advanceIdentity(newIdentity)
-            guard isCurrent(newIdentity), schedulerMutation == mutation else { return }
+            guard isOperationCurrent(newIdentity, operation: operation), schedulerMutation == mutation else { return }
             schedulerMutation = nil
             let pending = pendingSegments
             pendingSegments.removeAll()
             for segment in pending where retainedRevisions[segment.segmentID] == segment.sourceRevision {
-                guard isCurrent(newIdentity) else { return }
+                guard isOperationCurrent(newIdentity, operation: operation) else { return }
                 await dependencies.scheduler.submit(segment)
             }
         } catch is CancellationError {
-            return
+            guard isOperationCurrent(newIdentity, operation: operation) else { return }
+            _ = beginStop(reason: .componentFailure, failure: .unavailable)
         } catch let code as FailureCode {
-            guard isCurrent(newIdentity) else { return }
+            guard isOperationCurrent(newIdentity, operation: operation) else { return }
             _ = beginStop(reason: .componentFailure, failure: code)
         } catch {
-            guard isCurrent(newIdentity) else { return }
+            guard isOperationCurrent(newIdentity, operation: operation) else { return }
             _ = beginStop(reason: .componentFailure, failure: .invalidConfiguration)
         }
     }
@@ -582,7 +598,6 @@ actor SessionCoordinator: SessionCoordinating {
         }
         let profile = try await dependencies.preferences.profiles().first { $0.id == profileID }
         if let profile {
-            cloudConfigRevision = profile.revision
             return profile
         }
         if config.requestedMode == .ai && required { throw FailureCode.invalidConfiguration }
@@ -604,6 +619,19 @@ actor SessionCoordinator: SessionCoordinating {
         case speech
     }
 
+    private func reserveOperation() -> UInt64 {
+        operationGeneration += 1
+        return operationGeneration
+    }
+
+    private func isOperationCurrent(_ candidate: SessionIdentity, operation: UInt64) -> Bool {
+        phase == .running && operationGeneration == operation && isCurrent(candidate)
+    }
+
+    private func isStartCurrent(_ generation: UInt64) -> Bool {
+        startupGeneration == generation && stopTask == nil && (phase == .starting || phase == .requestingCapture)
+    }
+
     private func isCurrent(_ candidate: SessionIdentity) -> Bool {
         acceptsEvents && identity == candidate
     }
@@ -618,10 +646,12 @@ actor SessionCoordinator: SessionCoordinating {
 
     private func beginStop(reason: StopReason, failure newFailure: FailureCode?) -> Task<Void, Never>? {
         if let stopTask { return stopTask }
-        guard acceptsEvents || identity != nil || phase == .preparing else { return nil }
+        guard acceptsEvents || identity != nil || startupTask != nil || phase == .preparing || phase == .starting else { return nil }
         acceptsEvents = false
         preparationGeneration += 1
         connectionTestGeneration += 1
+        startupGeneration += 1
+        operationGeneration += 1
         schedulerMutation = nil
         pendingSegments.removeAll()
         if let newFailure {
@@ -651,10 +681,10 @@ actor SessionCoordinator: SessionCoordinating {
         await dependencies.segmenter.reset()
         await dependencies.mainActor.releaseAssets()
         if let sessionID { await dependencies.mainActor.stopPiP(sessionID: sessionID) }
+        for task in tasks { await task.value }
         await dependencies.mainActor.clearRenderer()
         await dependencies.captions.clear()
         await dependencies.diagnostics.clearSession()
-        for task in tasks { await task.value }
         consumerTasks.removeAll()
         retainedRevisions.removeAll()
         retainedOrder.removeAll()

@@ -274,6 +274,142 @@ func testCurrentSchedulerFailureAfterModeChangeFallsBack() async throws {
     try sessionRequire(fallback.engineEpoch == current.engineEpoch + 1, "current failure did not advance engine")
 }
 
+func testConcurrentStartSharesOneStartup() async throws {
+    let profile = makeCloudProfile()
+    let rig = await SessionTestRig.make(profile: profile)
+    await rig.coordinator.prepare(config: makeSessionConfig(mode: .ai, profileID: profile.id))
+    await rig.preferences.suspendProfileLoads()
+    let first = Task { await rig.coordinator.start() }
+    let second = Task { await rig.coordinator.start() }
+    try await sessionEventually("first profile load did not begin") {
+        await rig.preferences.profileLoadCount >= 1
+    }
+    await rig.preferences.releaseProfileLoads()
+    await first.value
+    await second.value
+    try sessionRequire(await rig.audioSource.startCount == 1, "concurrent start created two capture streams")
+    try sessionRequire(await rig.speech.startCount == 1, "concurrent start created two speech streams")
+    try sessionRequire(await rig.scheduler.startIdentities.count == 1, "concurrent start created two schedulers")
+    try sessionRequire(await rig.pip.startedSessionIDs.count == 1, "concurrent start created two PiP controllers")
+    try sessionRequire(await rig.coordinator.currentStatus.phase == .running, "concurrent start did not finish")
+}
+
+func testModeChangeDuringStartupDoesNotAbortPipeline() async throws {
+    let profile = makeCloudProfile()
+    let rig = await SessionTestRig.make(profile: profile)
+    await rig.coordinator.prepare(config: makeSessionConfig(mode: .ai, profileID: profile.id))
+    await MainActor.run { rig.audioSource.suspendNextStart() }
+    let start = Task { await rig.coordinator.start() }
+    try await sessionEventually("capture start gate was not armed") {
+        await rig.audioSource.startCount == 1
+    }
+    await rig.coordinator.selectMode(.local)
+    await MainActor.run { rig.audioSource.releaseStart() }
+    await start.value
+    try sessionRequire(await rig.coordinator.currentStatus.phase == .running, "startup mode call aborted startup")
+    try sessionRequire(await rig.coordinator.currentStatus.effectiveMode == .ai, "startup accepted a mode mutation")
+    try sessionRequire(await rig.speech.startCount == 1, "startup left speech unstarted")
+    try sessionRequire(await rig.scheduler.startIdentities.count == 1, "startup left scheduler unstarted")
+    try sessionRequire(await rig.pip.startedSessionIDs.count == 1, "startup left PiP unstarted")
+}
+
+func testOldModeChangeCannotAffectRestart() async throws {
+    let profile = makeCloudProfile()
+    let rig = await SessionTestRig.make(profile: profile)
+    await rig.prepareAndStart(mode: .local, profileID: profile.id)
+    await rig.preferences.suspendProfileLoads()
+    let loadCount = await rig.preferences.profileLoadCount
+    let oldOperation = Task { await rig.coordinator.selectMode(.ai) }
+    try await sessionEventually("old mode operation did not begin") {
+        await rig.preferences.profileLoadCount > loadCount
+    }
+    await rig.coordinator.stop(reason: .user)
+    await rig.preferences.allowNewProfileLoads()
+    await rig.prepareAndStart(mode: .local, profileID: profile.id)
+    let current = try await sessionUnwrapIdentity(rig.coordinator)
+    await rig.preferences.releaseProfileLoads()
+    await oldOperation.value
+    let status = await rig.coordinator.currentStatus
+    try sessionRequire(status.identity == current, "old mode operation changed the restarted identity")
+    try sessionRequire(status.requestedMode == .local && status.effectiveMode == .local, "old mode operation changed the restarted mode")
+}
+
+func testOldProfileDidChangeCannotAffectRestart() async throws {
+    let profile = makeCloudProfile(revision: 1)
+    let rig = await SessionTestRig.make(profile: profile)
+    await rig.prepareAndStart(mode: .ai, profileID: profile.id)
+    await rig.preferences.suspendProfileLoads()
+    let loadCount = await rig.preferences.profileLoadCount
+    let oldOperation = Task { await rig.coordinator.cloudProfileDidChange() }
+    try await sessionEventually("old profile operation did not begin") {
+        await rig.preferences.profileLoadCount > loadCount
+    }
+    await rig.coordinator.stop(reason: .user)
+    await rig.preferences.allowNewProfileLoads()
+    await rig.prepareAndStart(mode: .ai, profileID: profile.id)
+    let current = try await sessionUnwrapIdentity(rig.coordinator)
+    try await rig.preferences.saveProfile(makeCloudProfile(revision: 2))
+    await rig.preferences.releaseProfileLoads()
+    await oldOperation.value
+    let status = await rig.coordinator.currentStatus
+    try sessionRequire(status.identity == current, "old didChange changed the restarted identity")
+    try sessionRequire(status.effectiveMode == .ai, "old didChange forced the restarted session local")
+    try sessionRequire(status.identity?.cloudConfigRevision == 1, "old didChange changed the restarted revision")
+}
+
+func testStopClearsAfterInflightSegmentWrite() async throws {
+    let rig = await SessionTestRig.make()
+    await rig.prepareAndStart()
+    await rig.store.suspendNextUpsert(releaseOnClear: true)
+    await rig.segmenter.emit(.upsert(makeCaptionSegment()))
+    try await sessionEventually("upsert gate was not armed") {
+        await rig.store.upsertCount == 1
+    }
+    let stop = Task { await rig.coordinator.stop(reason: .user) }
+    try await sessionEventually("stop did not begin") {
+        await rig.scheduler.stopCount == 1
+    }
+    for _ in 0..<100 { await Task.yield() }
+    await rig.store.releaseUpsert()
+    await stop.value
+    let oldSnapshot = await rig.store.snapshot(mode: .local, status: .listening)
+    try sessionRequire(oldSnapshot?.segments.isEmpty == true, "old upsert completed after final clear")
+    await rig.prepareAndStart()
+    let newSnapshot = await rig.store.snapshot(mode: .local, status: .listening)
+    try sessionRequire(newSnapshot?.segments.isEmpty == true, "old segment polluted the restarted store")
+}
+
+func testSetModeCancellationStopsAndReleasesBarrier() async throws {
+    let profile = makeCloudProfile()
+    let rig = await SessionTestRig.make(profile: profile)
+    await rig.prepareAndStart(mode: .local, profileID: profile.id)
+    await rig.scheduler.throwSetMode(CancellationError())
+    await rig.coordinator.selectMode(.ai)
+    try await sessionEventually("setMode cancellation left the session running") {
+        await rig.coordinator.currentStatus.phase == .failed
+    }
+    await rig.segmenter.emit(.upsert(makeCaptionSegment()))
+    await Task.yield()
+    try sessionRequire(await rig.scheduler.submittedSegments.isEmpty, "cancelled mode change left a pending-job barrier")
+}
+
+func testProfileChangeThenExplicitAIUsesNewRevision() async throws {
+    let profile = makeCloudProfile(revision: 1)
+    let rig = await SessionTestRig.make(profile: profile)
+    await rig.prepareAndStart(mode: .ai, profileID: profile.id)
+    await rig.coordinator.cloudProfileWillChange()
+    let newProfile = makeCloudProfile(revision: 2)
+    try await rig.preferences.saveProfile(newProfile)
+    await rig.coordinator.cloudProfileDidChange()
+    try sessionRequire(await rig.coordinator.currentStatus.identity?.cloudConfigRevision == 2, "didChange retained stale revision")
+    await rig.coordinator.selectMode(.ai)
+    let status = await rig.coordinator.currentStatus
+    try sessionRequire(status.effectiveMode == .ai, "explicit AI rejected the new profile")
+    try sessionRequire(status.identity?.cloudConfigRevision == 2, "explicit AI used stale revision")
+    let calls = await rig.scheduler.modeCalls
+    try sessionRequire(calls.last?.profile == newProfile, "explicit AI used the old profile")
+}
+
 func sessionUnwrapIdentity(_ coordinator: SessionCoordinator) async throws -> SessionIdentity {
     guard let identity = await coordinator.currentStatus.identity else {
         throw SessionTestFailure(message: "missing active identity")
@@ -295,14 +431,30 @@ private struct SessionHostChecks {
             ("testConfigurationMutationBarrier", testConfigurationMutationBarrier),
             ("testModeChangeKeepsSpeechStreamAlive", testModeChangeKeepsSpeechStreamAlive),
             ("testBufferedOldSchedulerFailureIsIgnored", testBufferedOldSchedulerFailureIsIgnored),
-            ("testCurrentSchedulerFailureAfterModeChangeFallsBack", testCurrentSchedulerFailureAfterModeChangeFallsBack)
+            ("testCurrentSchedulerFailureAfterModeChangeFallsBack", testCurrentSchedulerFailureAfterModeChangeFallsBack),
+            ("testConcurrentStartSharesOneStartup", testConcurrentStartSharesOneStartup),
+            ("testModeChangeDuringStartupDoesNotAbortPipeline", testModeChangeDuringStartupDoesNotAbortPipeline),
+            ("testOldModeChangeCannotAffectRestart", testOldModeChangeCannotAffectRestart),
+            ("testOldProfileDidChangeCannotAffectRestart", testOldProfileDidChangeCannotAffectRestart),
+            ("testStopClearsAfterInflightSegmentWrite", testStopClearsAfterInflightSegmentWrite),
+            ("testSetModeCancellationStopsAndReleasesBarrier", testSetModeCancellationStopsAndReleasesBarrier),
+            ("testProfileChangeThenExplicitAIUsesNewRevision", testProfileChangeThenExplicitAIUsesNewRevision)
         ]
+        var failures: [String] = []
         for (name, check) in checks {
             print("RUN \(name)")
-            try await check()
-            print("PASS \(name)")
+            do {
+                try await check()
+                print("PASS \(name)")
+            } catch {
+                print("FAIL \(name): \(error)")
+                failures.append(name)
+            }
         }
-        print("\(checks.count) Session host checks passed; no SDK/device behavior tested.")
+        print("\(checks.count - failures.count)/\(checks.count) Session host checks passed; no SDK/device behavior tested.")
+        if !failures.isEmpty {
+            throw SessionTestFailure(message: "failed: \(failures.joined(separator: ", "))")
+        }
     }
 }
 #else
@@ -317,5 +469,12 @@ struct SessionCoordinatorTests {
     @Test func modeChangeKeepsSpeechStreamAlive() async throws { try await testModeChangeKeepsSpeechStreamAlive() }
     @Test func bufferedOldSchedulerFailureIsIgnored() async throws { try await testBufferedOldSchedulerFailureIsIgnored() }
     @Test func currentSchedulerFailureAfterModeChangeFallsBack() async throws { try await testCurrentSchedulerFailureAfterModeChangeFallsBack() }
+    @Test func concurrentStartSharesOneStartup() async throws { try await testConcurrentStartSharesOneStartup() }
+    @Test func modeChangeDuringStartupDoesNotAbortPipeline() async throws { try await testModeChangeDuringStartupDoesNotAbortPipeline() }
+    @Test func oldModeChangeCannotAffectRestart() async throws { try await testOldModeChangeCannotAffectRestart() }
+    @Test func oldProfileDidChangeCannotAffectRestart() async throws { try await testOldProfileDidChangeCannotAffectRestart() }
+    @Test func stopClearsAfterInflightSegmentWrite() async throws { try await testStopClearsAfterInflightSegmentWrite() }
+    @Test func setModeCancellationStopsAndReleasesBarrier() async throws { try await testSetModeCancellationStopsAndReleasesBarrier() }
+    @Test func profileChangeThenExplicitAIUsesNewRevision() async throws { try await testProfileChangeThenExplicitAIUsesNewRevision() }
 }
 #endif
