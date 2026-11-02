@@ -105,7 +105,7 @@ func runAudioTimeMapperChecks() async throws {
 @main
 struct Task04HostChecks {
     static func main() async throws {
-        let checks: [(String, () async throws -> Void)] = [
+        let allChecks: [(String, () async throws -> Void)] = [
             ("continuousSampleClock", testContinuousSampleClockIgnoresCaptureOrigin),
             ("oneFrameCaptureDrift", testCaptureClockOneFrameDriftDoesNotResetTimeline),
             ("realPTSGap", testRealPTSGapMarksDiscontinuity),
@@ -119,8 +119,17 @@ struct Task04HostChecks {
             ("formatChange", checkFormatChangeRebuildsConverter),
             ("oversizedMetadata", checkOversizedPCMMetadataIsRejected),
             ("pickerCancellation", checkCapturePickerCancellationReturnsCancellationError),
-            ("captureLifecycle", checkCaptureSourceDeliversAudioAndStopsDriver)
+            ("captureLifecycle", checkCaptureSourceDeliversAudioAndStopsDriver),
+            ("gracefulEOF", checkGracefulEndDrainsQueuedAudio),
+            ("converterDrain", checkConverterEndOfStreamDeliversTail),
+            ("oldPipelineCancellation", checkOldOutputCancellationDoesNotStopNewPipeline),
+            ("oldCaptureCancellation", checkOldOutputCancellationDoesNotStopNewCapture),
+            ("pendingPickerCancellation", checkPendingPickerStartRespondsToCancellation),
+            ("explicitCaptureStop", checkExplicitCaptureStopClearsQueuedAudio),
+            ("coreEventGeneration", checkCaptureEventGenerationRejectsOldCoreCallbacks)
         ]
+        let selected = Set(CommandLine.arguments.dropFirst())
+        let checks = allChecks.filter { selected.isEmpty || selected.contains($0.0) }
         for (name, check) in checks {
             try await check()
             print("PASS \(name)")

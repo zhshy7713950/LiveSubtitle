@@ -56,6 +56,20 @@ enum AudioPCMBufferCopy {
     }
 }
 
+struct CaptureEventGeneration {
+    private(set) var current: UInt64 = 0
+
+    @discardableResult
+    mutating func advance() -> UInt64 {
+        current &+= 1
+        return current
+    }
+
+    func accepts(_ token: UInt64) -> Bool {
+        token == current
+    }
+}
+
 @MainActor
 protocol ScreenCaptureDriving: AnyObject {
     func start(buffer: BoundedAudioEventBuffer, identity: SessionIdentity) async throws
@@ -67,6 +81,7 @@ final class ScreenCaptureAudioSource: AudioSource {
     private let driver: (any ScreenCaptureDriving)?
     private var activeBuffer: BoundedAudioEventBuffer?
     private var isActive = false
+    private var generation = CaptureEventGeneration()
 
     init() {
 #if os(iOS) && !targetEnvironment(simulator)
@@ -83,15 +98,25 @@ final class ScreenCaptureAudioSource: AudioSource {
     func start(config: CaptureConfig) async throws -> AsyncStream<AudioSourceEvent> {
         if isActive || activeBuffer != nil { await stop() }
         guard let driver else { throw FailureCode.unavailable }
+        let token = generation.advance()
         let buffer = BoundedAudioEventBuffer()
         activeBuffer = buffer
         do {
-            try await driver.start(buffer: buffer, identity: config.identity)
+            try await withTaskCancellationHandler {
+                try await driver.start(buffer: buffer, identity: config.identity)
+            } onCancel: {
+                Task { await self.stopIfCurrent(token, buffer: buffer) }
+            }
+            try Task.checkCancellation()
+            guard generation.accepts(token), activeBuffer === buffer else { throw CancellationError() }
             isActive = true
         } catch {
-            buffer.close()
-            activeBuffer = nil
-            await driver.stop()
+            if generation.accepts(token), activeBuffer === buffer {
+                buffer.close()
+                activeBuffer = nil
+                isActive = false
+                await driver.stop()
+            }
             if let error = error as? CancellationError { throw error }
             if let error = error as? FailureCode { throw error }
             throw FailureCode.captureFailed
@@ -100,16 +125,22 @@ final class ScreenCaptureAudioSource: AudioSource {
             await buffer.next()
         }, onCancel: {
             buffer.close()
-            Task { await self.stop() }
+            Task { await self.stopIfCurrent(token, buffer: buffer) }
         })
     }
 
     func stop() async {
+        generation.advance()
         let shouldStopDriver = isActive || activeBuffer != nil
-        activeBuffer?.finish(.ended)
+        activeBuffer?.close()
         activeBuffer = nil
         isActive = false
         if shouldStopDriver { await driver?.stop() }
+    }
+
+    private func stopIfCurrent(_ token: UInt64, buffer: BoundedAudioEventBuffer) async {
+        guard generation.accepts(token), activeBuffer === buffer else { return }
+        await stop()
     }
 }
 
@@ -126,18 +157,22 @@ private enum ScreenCaptureCoreEvent: Sendable {
 
 @MainActor
 private final class ScreenCaptureDriver: ScreenCaptureDriving {
-    private var core: ScreenCaptureCore?
-    private var startContinuation: CheckedContinuation<Void, Error>?
+    private var generation = CaptureEventGeneration()
+    private var currentToken: UInt64?
+    private var cores: [UInt64: ScreenCaptureCore] = [:]
+    private var startContinuations: [UInt64: CheckedContinuation<Void, Error>] = [:]
 
     func start(buffer: BoundedAudioEventBuffer, identity: SessionIdentity) async throws {
-        if core != nil { await stop() }
+        if currentToken != nil { await stop() }
         let picker = SCContentSharingPicker.shared
         guard picker.isAvailable else { throw FailureCode.unavailable }
+        let token = generation.advance()
+        currentToken = token
         let core = ScreenCaptureCore(buffer: buffer)
-        self.core = core
+        cores[token] = core
         core.setHandler { [weak self] event in
             Task { @MainActor [weak self] in
-                self?.handle(event)
+                self?.handle(event, token: token)
             }
         }
         var configuration = SCContentSharingPickerConfiguration()
@@ -147,49 +182,51 @@ private final class ScreenCaptureDriver: ScreenCaptureDriving {
         picker.add(core)
         picker.isActive = true
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            startContinuation = continuation
+            startContinuations[token] = continuation
             picker.present()
         }
     }
 
     func stop() async {
-        if let continuation = startContinuation {
-            startContinuation = nil
+        guard let token = currentToken, let core = cores[token] else { return }
+        currentToken = nil
+        if let continuation = startContinuations.removeValue(forKey: token) {
             continuation.resume(throwing: CancellationError())
         }
-        guard let core else { return }
         let picker = SCContentSharingPicker.shared
         picker.remove(core)
         picker.isActive = false
         await withCheckedContinuation { continuation in
             core.stop { continuation.resume() }
         }
-        self.core = nil
+        cores.removeValue(forKey: token)
     }
 
-    private func handle(_ event: ScreenCaptureCoreEvent) {
-        guard let core else { return }
+    private func handle(_ event: ScreenCaptureCoreEvent, token: UInt64) {
+        guard let core = cores[token] else { return }
         switch event {
         case .started(let code):
             let started = core.startCompleted(code)
-            guard let continuation = startContinuation else { return }
-            startContinuation = nil
-            if started {
+            guard let continuation = startContinuations.removeValue(forKey: token) else { return }
+            if currentToken == token, started {
                 continuation.resume()
-            } else {
+            } else if code != nil {
                 continuation.resume(throwing: FailureCode.captureFailed)
+            } else {
+                continuation.resume(throwing: CancellationError())
             }
         case .cancelled:
-            guard let continuation = startContinuation else { return }
-            startContinuation = nil
+            guard let continuation = startContinuations.removeValue(forKey: token) else { return }
             continuation.resume(throwing: CancellationError())
         case .failed:
-            guard let continuation = startContinuation else { return }
-            startContinuation = nil
+            guard let continuation = startContinuations.removeValue(forKey: token) else { return }
             continuation.resume(throwing: FailureCode.captureFailed)
         case .stopped(let code):
             core.stopCompleted(code)
-            self.core = nil
+            cores.removeValue(forKey: token)
+            if let continuation = startContinuations.removeValue(forKey: token) {
+                continuation.resume(throwing: CancellationError())
+            }
         }
     }
 }

@@ -95,9 +95,11 @@ final class BoundedAudioEventBuffer: Sendable {
             guard !value.closed else { return }
             value.closed = true
             value.terminal = event
-            value.chunks.removeAll()
-            value.bufferedDuration = 0
-            value.inFlightDuration = 0
+            if case .failed = event {
+                value.chunks.removeAll()
+                value.bufferedDuration = 0
+                value.inFlightDuration = 0
+            }
             if let waiter = value.waiter, case .event(let event) = Self.poll(&value) {
                 value.waiter = nil
                 delivery = (waiter, event)
@@ -156,15 +158,19 @@ final class BoundedAudioEventBuffer: Sendable {
     var hasWaiter: Bool { state.withLock { $0.waiter != nil } }
 
     private static func poll(_ value: inout State) -> Poll {
+        if !value.chunks.isEmpty {
+            let chunk = value.chunks.removeFirst()
+            value.inFlightDuration = duration(of: chunk)
+            return .event(.chunk(chunk))
+        }
         if let terminal = value.terminal {
             value.terminal = nil
+            value.bufferedDuration = 0
+            value.inFlightDuration = 0
             return .event(terminal)
         }
         if value.closed { return .event(nil) }
-        guard !value.chunks.isEmpty else { return .empty }
-        let chunk = value.chunks.removeFirst()
-        value.inFlightDuration = duration(of: chunk)
-        return .event(.chunk(chunk))
+        return .empty
     }
 
     private static func duration(of chunk: AudioChunk) -> Double {
@@ -191,6 +197,7 @@ actor AudioPipeline: AudioProcessing {
     private var mapper = AudioTimeMapper()
     private var previousSequence: UInt64?
     private var previousSourceFormat: AudioFormatKey?
+    private var lastSourceFrameCount = 0
     private(set) var activity: AudioActivity = .noSamples
 
     func process(_ input: AsyncStream<AudioSourceEvent>, target: AudioFormat) async -> AsyncStream<AudioSourceEvent> {
@@ -210,7 +217,7 @@ actor AudioPipeline: AudioProcessing {
             await buffer.next()
         }, onCancel: {
             buffer.close()
-            Task { await self.stop() }
+            Task { await self.stopIfCurrent(token, buffer: buffer) }
         })
         guard self.target != nil else { return output }
 
@@ -239,18 +246,36 @@ actor AudioPipeline: AudioProcessing {
         mapper = AudioTimeMapper()
         previousSequence = nil
         previousSourceFormat = nil
+        lastSourceFrameCount = 0
         activity = .noSamples
+    }
+
+    private func stopIfCurrent(_ token: UInt64, buffer: BoundedAudioEventBuffer) {
+        guard token == generation, outputBuffer === buffer else { return }
+        stop()
     }
 
     private func inputFinished(into buffer: BoundedAudioEventBuffer, generation token: UInt64) {
         guard token == generation, !buffer.isClosed else { return }
-        buffer.finish(.ended)
+        do {
+            try drainConverter(into: buffer)
+            buffer.finish(.ended)
+        } catch let error as FailureCode {
+            buffer.finish(.failed(error))
+        } catch {
+            buffer.finish(.failed(.captureFailed))
+        }
+        converter = nil
+        converterSource = nil
     }
 
     private func ingest(_ event: AudioSourceEvent, into buffer: BoundedAudioEventBuffer, generation token: UInt64) -> Bool {
         guard token == generation else { return false }
         switch event {
-        case .ended, .failed:
+        case .ended:
+            inputFinished(into: buffer, generation: token)
+            return false
+        case .failed:
             buffer.finish(event)
             converter = nil
             converterSource = nil
@@ -269,6 +294,42 @@ actor AudioPipeline: AudioProcessing {
                 buffer.finish(.failed(.captureFailed))
                 return false
             }
+        }
+    }
+
+    private func drainConverter(into buffer: BoundedAudioEventBuffer) throws {
+        guard let converter, let target else { return }
+        let capacity = ceil(Double(lastSourceFrameCount) * target.sampleRate / converter.inputFormat.sampleRate) + 64
+        guard capacity > 0, capacity <= Double(UInt32.max) else { throw FailureCode.captureFailed }
+        while !buffer.isClosed {
+            guard let output = AVAudioPCMBuffer(
+                pcmFormat: converter.outputFormat,
+                frameCapacity: AVAudioFrameCount(capacity)
+            ) else { throw FailureCode.captureFailed }
+            var conversionError: NSError?
+            let status = converter.convert(to: output, error: &conversionError) { _, status in
+                status.pointee = .endOfStream
+                return nil
+            }
+            guard status != .error, conversionError == nil else { throw FailureCode.captureFailed }
+            if output.frameLength == 0 { break }
+            let timestamp = try mapper.mapDrainedOutput(
+                frameCount: Int(output.frameLength),
+                sampleRate: target.sampleRate
+            )
+            let baseSequence = previousSequence ?? 0
+            let (sequence, overflow) = baseSequence.addingReportingOverflow(1)
+            guard !overflow else { throw FailureCode.captureFailed }
+            let chunk = try AudioPCMBufferCopy.chunk(
+                from: output,
+                sequence: sequence,
+                capturePTS: timestamp,
+                discontinuity: false
+            )
+            previousSequence = sequence
+            activity = chunk.ownedPCM.allSatisfy({ data in data.allSatisfy { $0 == 0 } })
+                ? .silence : .audible
+            buffer.push(chunk)
         }
     }
 
@@ -333,6 +394,7 @@ actor AudioPipeline: AudioProcessing {
         )
         previousSequence = chunk.sequence
         previousSourceFormat = sourceKey
+        lastSourceFrameCount = chunk.frameCount
         guard outputBuffer.frameLength > 0 else { return nil }
         return try AudioPCMBufferCopy.chunk(from: outputBuffer, sequence: chunk.sequence,
                                             capturePTS: timestamp, discontinuity: reset)

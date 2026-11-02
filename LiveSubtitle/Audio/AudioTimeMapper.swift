@@ -47,6 +47,15 @@ struct AudioTimeMapper {
         return mapped
     }
 
+    mutating func mapDrainedOutput(frameCount: Int, sampleRate: Double) throws -> AudioTimestamp {
+        guard frameCount > 0, Self.isIntegerRate(sampleRate) else { throw FailureCode.captureFailed }
+        let mapped = AudioTimestamp(value: nextOutputFrame, timescale: Int32(sampleRate))
+        let (advanced, overflow) = nextOutputFrame.addingReportingOverflow(Int64(frameCount))
+        guard !overflow else { throw FailureCode.captureFailed }
+        nextOutputFrame = advanced
+        return mapped
+    }
+
     private static func validateSource(
         capturePTS: AudioTimestamp,
         frameCount: Int,

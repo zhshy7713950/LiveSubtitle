@@ -319,6 +319,159 @@ func checkCaptureSourceDeliversAudioAndStopsDriver() async throws {
     try task04Require(stopCallCount == 1, "source stop must stop the underlying driver")
 }
 
+@MainActor
+private final class Task04PendingCaptureDriver: ScreenCaptureDriving {
+    private var continuation: CheckedContinuation<Void, Error>?
+    var startCallCount = 0
+    var stopCallCount = 0
+
+    func start(buffer: BoundedAudioEventBuffer, identity: SessionIdentity) async throws {
+        startCallCount += 1
+        try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func stop() async {
+        stopCallCount += 1
+    }
+
+    func completeStart() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+func checkGracefulEndDrainsQueuedAudio() async throws {
+    let pipeline = AudioPipeline()
+    let inputBuffer = BoundedAudioEventBuffer()
+    inputBuffer.push(task04Chunk(sequence: 1, captureFrame: 0, frameCount: 160))
+    inputBuffer.push(task04Chunk(sequence: 2, captureFrame: 160, frameCount: 160))
+    inputBuffer.finish(.ended)
+    let input = AsyncStream<AudioSourceEvent>(unfolding: { await inputBuffer.next() },
+                                              onCancel: { inputBuffer.close() })
+    let output = await pipeline.process(input, target: task04Format())
+    let first = try task04Chunk(from: await task04Next(output))
+    let second = try task04Chunk(from: await task04Next(output))
+    try task04Require(first.sequence == 1 && second.sequence == 2,
+                      "graceful EOF must preserve queued audio before the terminal event")
+    guard case .ended = await task04Next(output) else {
+        throw Task04CheckFailure(message: "queued audio must be followed by ended")
+    }
+    await pipeline.stop()
+}
+
+func checkConverterEndOfStreamDeliversTail() async throws {
+    let pipeline = AudioPipeline()
+    let target = task04Format(commonFormat: .pcmFormatFloat32)
+    let inputBuffer = BoundedAudioEventBuffer()
+    inputBuffer.push(task04Chunk(sequence: 1, captureFrame: 0, frameCount: 3,
+                                 sampleRate: 48_000, channels: 2, commonFormat: .pcmFormatFloat32))
+    inputBuffer.finish(.ended)
+    let input = AsyncStream<AudioSourceEvent>(unfolding: { await inputBuffer.next() },
+                                              onCancel: { inputBuffer.close() })
+    let output = await pipeline.process(input, target: target)
+    var outputFrames = 0
+    var sawEnded = false
+    for _ in 0..<4 {
+        let event = await task04Next(output)
+        if case .chunk(let chunk) = event {
+            outputFrames += chunk.frameCount
+        } else if case .ended = event {
+            sawEnded = true
+            break
+        }
+    }
+    try task04Require(sawEnded && outputFrames == 1,
+                      "three 48 kHz frames must drain as one 16 kHz frame before ended")
+    await pipeline.stop()
+}
+
+func checkOldOutputCancellationDoesNotStopNewPipeline() async throws {
+    for _ in 0..<10 {
+        let pipeline = AudioPipeline()
+        let firstInput = BoundedAudioEventBuffer()
+        let firstStream = AsyncStream<AudioSourceEvent>(unfolding: { await firstInput.next() },
+                                                        onCancel: { firstInput.close() })
+        let firstOutput = await pipeline.process(firstStream, target: task04Format())
+        let oldConsumer = Task {
+            var iterator = firstOutput.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+        await Task.yield()
+        oldConsumer.cancel()
+
+        let secondInput = BoundedAudioEventBuffer()
+        let secondStream = AsyncStream<AudioSourceEvent>(unfolding: { await secondInput.next() },
+                                                         onCancel: { secondInput.close() })
+        let secondOutput = await pipeline.process(secondStream, target: task04Format())
+        secondInput.push(task04Chunk(sequence: 1, captureFrame: 0, frameCount: 160))
+        let chunk = try task04Chunk(from: await task04Next(secondOutput))
+        try task04Require(chunk.sequence == 1, "late cancellation of an old output stopped the new pipeline")
+        await pipeline.stop()
+        firstInput.close()
+        secondInput.close()
+    }
+}
+
+func checkOldOutputCancellationDoesNotStopNewCapture() async throws {
+    for _ in 0..<10 {
+        let driver = await MainActor.run { Task04CaptureDriver() }
+        let source = await MainActor.run { ScreenCaptureAudioSource(driver: driver) }
+        let firstOutput = try await source.start(config: task04CaptureConfig())
+        let oldConsumer = Task {
+            var iterator = firstOutput.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+        await Task.yield()
+        oldConsumer.cancel()
+        let secondOutput = try await source.start(config: task04CaptureConfig())
+        await MainActor.run { driver.emit(.chunk(task04Chunk(sequence: 1, captureFrame: 0, frameCount: 160))) }
+        let chunk = try task04Chunk(from: await task04Next(secondOutput))
+        try task04Require(chunk.sequence == 1, "late cancellation of old capture output stopped the new source")
+        await source.stop()
+    }
+}
+
+func checkPendingPickerStartRespondsToCancellation() async throws {
+    let driver = await MainActor.run { Task04PendingCaptureDriver() }
+    let source = await MainActor.run { ScreenCaptureAudioSource(driver: driver) }
+    let startTask = Task { try await source.start(config: task04CaptureConfig()) }
+    for _ in 0..<100 {
+        let started = await MainActor.run { driver.startCallCount == 1 }
+        if started { break }
+        await Task.yield()
+    }
+    startTask.cancel()
+    await MainActor.run { driver.completeStart() }
+    do {
+        _ = try await startTask.value
+        throw Task04CheckFailure(message: "cancelled picker start returned an active stream")
+    } catch is CancellationError {
+        // Required cancellation semantics.
+    }
+    let stopCallCount = await MainActor.run { driver.stopCallCount }
+    try task04Require(stopCallCount >= 1, "cancelling a pending picker must release the driver")
+}
+
+func checkCaptureEventGenerationRejectsOldCoreCallbacks() throws {
+    var generation = CaptureEventGeneration()
+    let old = generation.advance()
+    let current = generation.advance()
+    try task04Require(!generation.accepts(old) && generation.accepts(current),
+                      "a late core callback must not be applied to the current capture generation")
+}
+
+func checkExplicitCaptureStopClearsQueuedAudio() async throws {
+    let driver = await MainActor.run { Task04CaptureDriver() }
+    let source = await MainActor.run { ScreenCaptureAudioSource(driver: driver) }
+    let output = try await source.start(config: task04CaptureConfig())
+    await MainActor.run { driver.emit(.chunk(task04Chunk(sequence: 1, captureFrame: 0, frameCount: 160))) }
+    await source.stop()
+    let event = await task04Next(output)
+    try task04Require(event == nil, "explicit stop must clear queued PCM instead of draining it")
+}
+
 func runAudioPipelineChecks() async throws {
     try checkPCMOwnershipSurvivesCallbackReturn()
     try await checkOverflowDropsOldestAndMarksDiscontinuity()
@@ -329,6 +482,13 @@ func runAudioPipelineChecks() async throws {
     try await checkOversizedPCMMetadataIsRejected()
     try await checkCapturePickerCancellationReturnsCancellationError()
     try await checkCaptureSourceDeliversAudioAndStopsDriver()
+    try await checkGracefulEndDrainsQueuedAudio()
+    try await checkConverterEndOfStreamDeliversTail()
+    try await checkOldOutputCancellationDoesNotStopNewPipeline()
+    try await checkOldOutputCancellationDoesNotStopNewCapture()
+    try await checkPendingPickerStartRespondsToCancellation()
+    try await checkExplicitCaptureStopClearsQueuedAudio()
+    try checkCaptureEventGenerationRejectsOldCoreCallbacks()
 }
 
 #if !TASK04_HOST_CHECK
@@ -359,6 +519,27 @@ struct AudioPipelineTests {
     }
     @Test func testCaptureSourceDeliversAudioAndStopsDriver() async throws {
         try await checkCaptureSourceDeliversAudioAndStopsDriver()
+    }
+    @Test func testGracefulEndDrainsQueuedAudio() async throws {
+        try await checkGracefulEndDrainsQueuedAudio()
+    }
+    @Test func testConverterEndOfStreamDeliversTail() async throws {
+        try await checkConverterEndOfStreamDeliversTail()
+    }
+    @Test func testOldOutputCancellationDoesNotStopNewPipeline() async throws {
+        try await checkOldOutputCancellationDoesNotStopNewPipeline()
+    }
+    @Test func testOldOutputCancellationDoesNotStopNewCapture() async throws {
+        try await checkOldOutputCancellationDoesNotStopNewCapture()
+    }
+    @Test func testPendingPickerStartRespondsToCancellation() async throws {
+        try await checkPendingPickerStartRespondsToCancellation()
+    }
+    @Test func testExplicitCaptureStopClearsQueuedAudio() async throws {
+        try await checkExplicitCaptureStopClearsQueuedAudio()
+    }
+    @Test func testCaptureEventGenerationRejectsOldCoreCallbacks() throws {
+        try checkCaptureEventGenerationRejectsOldCoreCallbacks()
     }
 }
 #endif
