@@ -1,0 +1,3 @@
+// Copy to Local.xcconfig (ignored by Git) and use your own Apple team.
+// DEVELOPMENT_TEAM = YOUR_TEAM_ID
+// Bundle identifier overrides belong in Xcode user-defined settings or a reviewed App.xcconfig change.
