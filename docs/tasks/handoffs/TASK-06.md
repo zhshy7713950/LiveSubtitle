@@ -63,6 +63,8 @@
 | 既有 `TASK04_HOST_CHECK` | 21 项 | 21 项执行通过 | 不包含 iOS 采集／设备行为 |
 | 最终 `scripts/verify.sh` | Xcode 27.2；iOS Debug、Release、generic simulator App／测试 bundle | 退出码 0 | 不执行行为测试 |
 | `scripts/test.sh '<simulator-UDID>' -only-testing:LiveSubtitleTests` | `simctl list devices available` 无设备 | 未执行 | 无可用 iOS 27 模拟器运行时 |
+| 真机 `xcodebuild ... test -only-testing:` 三个 Captions 套件 | iPhone 17 Pro／iOS 27.2；3 suites／28 tests | 28 项实际执行通过，0 跳过 | XCTest 空入口另显示 0 tests，以 Swift Testing 汇总为准 |
+| 真机 `xcodebuild ... test -only-testing:LiveSubtitleTests` | 同一设备；10 suites／84 tests | 84 项实际执行通过，0 跳过 | 有一条 AVAudioSession 主线程 Hang Risk 警告，见下文 |
 | 任务卡逐项验收 | 固定事件、fake clock、十分钟压力输入 | 主机逻辑均执行通过 | 真机完整链路不属于本轮证据 |
 
 主机复现命令：
@@ -88,6 +90,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
 
 ## 未验证与已知问题
 
-- G0 尚未通过；本轮没有真实识别、翻译、采集、PiP、Chrome 或设备生命周期执行证据。
-- 无模拟器运行时，未执行 iOS 测试 target；主机测试和 generic simulator 测试 bundle 编译不能替代该执行。
+- G0 尚未通过；本轮设备证据是测试 target 执行，不是 Chrome 真实采音、用户授权共享、PiP 持续刷新或十五分钟完整链路验收。
+- 完整真机测试日志出现一条 `AVAudioSession Hang Risk` 主线程警告；84 项仍全部通过。该警告属于既有音频路径，未在本任务中修改，集成人应连同 TASK-04 证据核查。
+- 无模拟器运行时，未执行 iOS 模拟器测试 target；真机与主机执行不能替代模拟器矩阵。
 - 集成人需把 SegmentEvent 同步到 store／scheduler，并在段淘汰后按 snapshot 将保留 ID 交给 `retainOnly`；停止时同时调用 `CaptionSegmenter.reset()` 与 `CaptionStore.clear()`。
