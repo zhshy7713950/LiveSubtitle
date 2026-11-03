@@ -46,7 +46,9 @@ let coordinator = SessionCoordinator(dependencies: dependencies)
 | Session host checks（Swift 6 `-strict-concurrency=complete`） | 17 项纯逻辑行为检查 | 17/17 通过 | 无 SDK、模拟器或真机行为证据 |
 | 既有 G0 host checks | 13 项纯逻辑回归 | 13/13 通过 | 不代表 G0 真机验收通过 |
 | `./scripts/test.sh '<simulator-UDID>' -only-testing:LiveSubtitleTests` | 当前 `simctl list devices available` 无可用模拟器 | 未执行 | 无 iOS 27 模拟器运行时；只完成测试 bundle 编译 |
-| 任务卡逐项验收 | 九项均有对应可执行主机测试 | 主机逻辑通过 | 真机生命周期、系统 PiP 和实际 SDK 未验证 |
+| `xcodebuild ... -destination 'platform=iOS,id=<device>' -allowProvisioningUpdates test` | 已配对真机；35 项 / 5 suites | 33 项执行通过，2 项跳过；其中 SessionCoordinatorTests 17/17 通过 | 2 项 G0 翻译测试因本地低延迟资源条件未满足而跳过，不计为通过 |
+| `devicectl device install app` / `process launch --activate` | 同一真机、本地忽略签名配置 | 安装与前台启动成功，进程存活；屏幕确认 G0 就绪界面可见 | 未操作共享、采集或 PiP；界面截图已删除，未提交 |
+| 任务卡逐项验收 | 九项均有对应可执行主机测试 | 主机与真机均通过；Session 总计 17/17 | 真实系统 PiP 和采集生命周期未验证 |
 | 独立只读审查与修复回归 | 启动／配置重入、清库顺序、取消 barrier | 六项新增回归 RED→GREEN，最终 17/17 | 两项测试强化建议留作后续，不涉及已知生产错误 |
 
 ## 契约请求
@@ -55,7 +57,7 @@ let coordinator = SessionCoordinator(dependencies: dependencies)
 
 ## 未验证与已知问题
 
-- 未执行 iOS 模拟器行为测试、真实设备安装或 G0；实际 ScreenCaptureKit、Speech、Translation、PiP 组合与系统生命周期均未由本任务验证。
+- 未执行 iOS 模拟器行为测试或完整 G0；真实设备已安装并启动 App，但 ScreenCaptureKit、连续 Speech／Translation、PiP 组合与系统生命周期仍未由本任务验证。
 - 前置 G0 的十五分钟 Chrome 后台链路、有效非静音音频和系统停止场景仍未完成，不能据本任务测试宣称产品可用。
 - Speech 中继容量是本任务内部有界策略；真实事件速率与分段消费速度需在 TASK-05／06 合并后做积压验证，持续积压必须失败，不能反复丢弃后报成功。
 - TASK-13 需要在 MainActor 构造依赖并装配全部真实端口；本任务未修改 App 入口或共享工程文件。
