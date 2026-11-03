@@ -36,7 +36,7 @@
 - `Capture/ScreenCaptureAudioSource.swift`：实现 `@MainActor ScreenCaptureAudioSource: AudioSource`。默认初始化在 iOS 真机使用 `SCContentSharingPicker` 全屏选择器和 `SCStream` 音频输出；模拟器及非 iOS 默认构造抛 `unavailable`。选择器取消抛 `CancellationError`，不返回假活动流。
 - `Audio/AudioPipeline.swift`：实现 `actor AudioPipeline: AudioProcessing`。使用 `AVAudioConverter` 适配识别目标格式；采样率、声道、序号、显式断点或实际 PTS 断流变化时重建转换并标记 discontinuity。正常 EOF 先交付排队音频并以 `.endOfStream` 排空 converter；故障和主动停止立即清空。
 - `Audio/AudioTimeMapper.swift`：按实际输出帧数推进连续识别时钟，容忍不超过一个源帧的采集时钟漂移；converter 尾帧沿用同一样本时钟。
-- `LiveSubtitleTests/Audio/`：包含任务卡五项具名验收、取消、非法元数据、采集生命周期、快速重启、正常 EOF 与尾部排空测试。`TASK04_HOST_CHECK` 入口执行同一生产源码，可按名称筛选用例。
+- `LiveSubtitleTests/Audio/`：包含任务卡五项具名验收、取消、非法元数据、采集生命周期、快速重启、正常 EOF 与尾部排空测试。`TASK04_HOST_CHECK` 入口执行同一生产源码，可按名称筛选用例；`TASK04_INTERACTIVE` 另提供需要用户确认系统共享的真机采集测试，默认套件不包含该交互用例。
 - 对外初始化：`@MainActor ScreenCaptureAudioSource()`、`AudioPipeline()`。`ScreenCaptureAudioSource(driver:)` 是任务内测试装配入口；Contracts 无变化。
 
 ## 流与资源边界
@@ -57,6 +57,8 @@
 | AddressSanitizer／ThreadSanitizer | 修复后主机版本，各 20 项 | 均执行通过 | 不含新增主动停止用例及 iOS SDK |
 | 既有 `G0_HOST_CHECK` 回归 | 13 项 | 13 项执行通过 | 不包含 SDK／设备行为 |
 | `scripts/test.sh '<simulator-UDID>' -only-testing:LiveSubtitleTests` | `simctl list devices available` 无设备 | 未执行 | 无可用 iOS 27 模拟器运行时 |
+| 真机完整 `xcodebuild ... -only-testing:LiveSubtitleTests test` | iPhone 17 Pro／iOS 27.2；6 suites／39 tests | 39 项实际执行通过，0 跳过 | XCTest 空入口另显示 0 tests，以 Swift Testing 汇总为准 |
+| `TASK04_INTERACTIVE` 真机采集测试 | 同一设备；用户确认系统全屏共享 | 1 项执行通过：收到有效自有 PCM，主动停止关闭流 | 不记录音频内容；不覆盖 Chrome、路由或持续运行 |
 | 任务卡五项具名验收 | 主机逻辑／AVFoundation | 均执行通过 | 真实系统采集另行验证 |
 | `git diff --check` | 最终差异 | 退出码 0 | 无空白错误 |
 
@@ -74,6 +76,6 @@
 
 ## 未验证与已知问题
 
-- G0 尚未通过；本任务没有真机采音、Chrome、音频路由、系统选择器或完整链路的新执行证据。真实 SDK 代码仅完成 iOS Debug／Release 编译。
+- G0 尚未通过；本轮已在 iPhone 17 Pro／iOS 27.2 完成一次用户授权的真实采集与主动停止验证，但没有 Chrome、音频路由、系统撤销、长时间运行或完整链路的新执行证据。
 - 无模拟器运行时，未执行 iOS 测试 target；主机测试和 generic simulator 测试 bundle 编译不能替代该执行。
 - 集成人使用上述两个默认 initializer 装配；会话停止时必须同时显式调用 `ScreenCaptureAudioSource.stop()` 与 `AudioPipeline.stop()`，不能只依赖流取消。

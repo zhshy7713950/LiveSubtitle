@@ -543,3 +543,44 @@ struct AudioPipelineTests {
     }
 }
 #endif
+
+#if TASK04_INTERACTIVE && !targetEnvironment(simulator)
+struct ScreenCaptureAudioSourceDeviceTests {
+    @Test @MainActor func testUserAuthorizedCaptureDeliversOwnedAudioAndStops() async throws {
+        let source = ScreenCaptureAudioSource()
+        let stream = try await source.start(config: task04CaptureConfig())
+        do {
+            let event = try await withThrowingTaskGroup(of: AudioSourceEvent?.self) { group in
+                group.addTask {
+                    var iterator = stream.makeAsyncIterator()
+                    return await iterator.next()
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(20))
+                    return nil
+                }
+                let event = try await group.next()
+                group.cancelAll()
+                guard let event, let event else {
+                    throw Task04CheckFailure(message: "authorized capture delivered no audio sample within 20 seconds")
+                }
+                return event
+            }
+            guard case .chunk(let chunk) = event else {
+                throw Task04CheckFailure(message: "authorized capture did not start with an audio chunk")
+            }
+            try task04Require(chunk.frameCount > 0 && chunk.sampleRate > 0 && chunk.channels > 0,
+                              "device capture returned invalid audio metadata")
+            try task04Require(!chunk.ownedPCM.isEmpty && chunk.ownedPCM.allSatisfy { !$0.isEmpty },
+                              "device capture did not deliver owned PCM planes")
+            await source.stop()
+            var iterator = stream.makeAsyncIterator()
+            let afterStop = await iterator.next()
+            try task04Require(afterStop == nil, "device capture did not close its stream on explicit stop")
+        } catch {
+            await source.stop()
+            throw error
+        }
+    }
+}
+#endif
