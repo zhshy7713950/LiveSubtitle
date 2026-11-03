@@ -114,18 +114,8 @@ actor PreferencesStore: PreferencesStoring {
     }
 
     private static func isValid(_ profile: CloudProfile) -> Bool {
-        guard !profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !profile.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let components = URLComponents(url: profile.endpoint, resolvingAgainstBaseURL: false),
-              components.scheme?.lowercased() == "https",
-              let host = components.host, !host.isEmpty,
-              components.user == nil, components.password == nil else {
-            return false
-        }
-        let secretQueryNames: Set<String> = ["key", "api_key", "api-key", "access_token", "token"]
-        return !(components.queryItems ?? []).contains { item in
-            secretQueryNames.contains(item.name.lowercased())
-        }
+        !profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && EndpointValidator.validationFailure(for: profile) == nil
     }
 }
 

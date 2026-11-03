@@ -107,8 +107,19 @@ func task09BoundsAndRecovery() async throws {
         }
         try task09Require(try await store.load() == valid, "rejected preferences replaced valid data")
 
-        try await task09ExpectError(.invalidProfile) {
-            try await store.saveProfile(task09Profile(endpoint: URL(string: "http://provider.example/chat")!))
+        let validProfile = task09Profile()
+        try await store.saveProfile(validProfile)
+        let invalidEndpoints = [
+            "http://provider.example/chat",
+            "https://provider.example/chat?apiKey=fixture-secret",
+            "https://provider.example/chat?access-token=fixture-secret",
+            "https://provider.example/chat?signature=fixture-secret",
+            "https://provider.example/chat#fragment"
+        ]
+        for endpoint in invalidEndpoints {
+            try await task09ExpectError(.invalidProfile) {
+                try await store.saveProfile(task09Profile(endpoint: URL(string: endpoint)!))
+            }
         }
         try await task09ExpectError(.invalidProfile) {
             try await store.saveProfile(CloudProfile(
@@ -116,7 +127,7 @@ func task09BoundsAndRecovery() async throws {
                 model: "", revision: 1
             ))
         }
-        try task09Require(try await store.profiles().isEmpty, "invalid profile was persisted")
+        try task09Require(try await store.profiles() == [validProfile], "invalid profile replaced valid data")
 
         defaults.set(Data("broken".utf8), forKey: PreferencesStore.preferencesKey)
         defaults.set(Data("broken".utf8), forKey: PreferencesStore.profilesKey)
