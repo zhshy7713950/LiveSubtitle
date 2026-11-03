@@ -3,7 +3,7 @@
 - 基线 commit：`70eebed4f24c96779146db83f4555f82434178e0`
 - 任务分支 / commit：`worktree-task07-local`；本交接与实现同一提交，可用 `git log -1 -- docs/tasks/handoffs/TASK-07.md` 查询。
 - 前置报告：`docs/reports/g0-device-report.md` 仍明确为未完成；本任务按负责人明确指派独立开发，未把此前置写成通过。
-- 状态：待审查。八项主机行为检查及完整工程编译通过；模拟器与真实系统会话行为未验证。
+- 状态：待审查。八项主机与真机测试、完整 107 项真机测试及工程编译通过；模拟器和默认系统包装器的直接端到端行为未验证。
 
 ## 改动
 
@@ -29,6 +29,8 @@
 | 最终 `TASK07_HOST_CHECK` | macOS 27.2 SDK，目标 26.4；8 项 | 8 项执行通过；连续 1000 轮通过；AddressSanitizer / UndefinedBehaviorSanitizer 一轮、ThreadSanitizer 连续 20 轮通过 | 不执行真实 TranslationSession、下载、设备或后台行为 |
 | 既有主机回归 | G0 13 项、TASK-04 21 项、TASK-06 28 项、Session 17 项 | 79 项执行通过 | 不包含 iOS SDK／设备行为 |
 | `./scripts/test.sh '<simulator-UDID>' -only-testing:LiveSubtitleTests` | `simctl list runtimes` 与 available devices 均为空 | 未执行 | 无可用 iOS 27 模拟器；不把测试 bundle 编译称为测试通过 |
+| 真机 `xcodebuild ... test -only-testing:LiveSubtitleTests/AppleLocalTranslatorTests` | 已连接 iPhone／iOS 27.2；1 suite／8 tests | 8 项实际执行通过，0 跳过 | 使用注入会话，不直接执行默认系统包装器 |
+| 真机 `xcodebuild ... test -only-testing:LiveSubtitleTests` | 同一设备；13 suites／107 tests | 107 项实际执行通过，0 跳过；G0 翻译条件测试实际执行通过 | 有 4 条既有 `AVAudioSession Hang Risk` 主线程警告；不代表完整 G0 媒体链路通过 |
 | 任务卡逐项验收 | identity / assetsMissing / cancelAll 与消费者取消 / 会话复用、换对和安全 failure | 通过注入会话的主机行为检查 | 真实 SDK 对应行为待设备或模拟器执行 |
 
 主机检查复现命令：
@@ -56,8 +58,9 @@ swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
 
 ## 未验证与已知问题
 
-- 真实 `TranslationSession` 的 `isReady`、低延迟翻译、任务取消和跨作业复用尚未在 iOS 设备或模拟器执行；这里只有 SDK 编译证据和注入会话的行为证据。
+- `AppleLocalTranslator()` 的默认私有系统包装器尚未直接执行；真机 TASK-07 测试使用注入会话。全套中的 G0 翻译测试已在真机实际执行通过，但不能据此宣称本适配器的默认系统包装器已完成端到端验证。
 - 实际模型缺失时不触发系统下载、断网翻译及后台持续行为仍需设备验收；本任务没有自行下载或宣称 G0 通过。
-- 当前没有模拟器 runtime，因此 Swift Testing 版本尚未实际执行；主机入口运行同一组检查函数，不覆盖 XCTest/Swift Testing 启动差异。
+- Swift Testing 已在真机执行；当前没有模拟器 runtime，模拟器矩阵仍未验证。
+- 完整真机测试出现 4 条 `AVAudioSession Hang Risk` 主线程警告；107 项仍全部通过。该警告属于既有音频路径，本任务未修改，集成人应结合 TASK-04 证据核查。
 - TASK-13 需按 `RuntimePolicy.localConcurrency` 的调度约束装配，并在本地失败时由协调器停止会话；适配器自身不改变全局模式。
 - 未推送、未合并 main。
