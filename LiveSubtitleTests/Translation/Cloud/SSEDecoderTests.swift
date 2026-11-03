@@ -9,15 +9,6 @@ private struct SSETestFailure: Error {
 }
 
 private func checkEveryUTF8SplitAndSSEBoundary() throws {
-    let fixtures = [
-        ": comment\r\n",
-        "data: {\"text\":\"你\"}\r\n\r\n",
-        "data: first\r\n",
-        "data: second\n\n",
-        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
-        "data: {\"choices\":[]}\n\n",
-        "data: {\"usage\":{\"total_tokens\":2}}\n\n"
-    ]
     let expected = [
         "{\"text\":\"你\"}",
         "first\nsecond",
@@ -25,14 +16,35 @@ private func checkEveryUTF8SplitAndSSEBoundary() throws {
         "{\"choices\":[]}",
         "{\"usage\":{\"total_tokens\":2}}"
     ]
-    var decoder = SSEDecoder()
-    var events: [Data] = []
-    for byte in fixtures.joined().utf8 {
-        events.append(contentsOf: try decoder.append(Data([byte])))
-    }
-    events.append(contentsOf: try decoder.finish())
-    guard events.map({ String(decoding: $0, as: UTF8.self) }) == expected else {
-        throw SSETestFailure(message: "byte-split SSE events were changed or dropped")
+    for newline in ["\n", "\r\n", "\r"] {
+        let fixtures = [
+            ": comment" + newline,
+            "data: {\"text\":\"你\"}" + newline + newline,
+            "data: first" + newline,
+            "data: second" + newline + newline,
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}" + newline + newline,
+            "data: {\"choices\":[]}" + newline + newline,
+            "data: {\"usage\":{\"total_tokens\":2}}" + newline + newline
+        ]
+        let data = Data(fixtures.joined().utf8)
+        for split in 0...data.count {
+            var decoder = SSEDecoder()
+            var events = try decoder.append(data[..<split])
+            events.append(contentsOf: try decoder.append(data[split...]))
+            events.append(contentsOf: try decoder.finish())
+            guard events.map({ String(decoding: $0, as: UTF8.self) }) == expected else {
+                throw SSETestFailure(message: "SSE split \(split) with \(newline.debugDescription) changed events")
+            }
+        }
+        var byteDecoder = SSEDecoder()
+        var byteEvents: [Data] = []
+        for byte in data {
+            byteEvents.append(contentsOf: try byteDecoder.append(Data([byte])))
+        }
+        byteEvents.append(contentsOf: try byteDecoder.finish())
+        guard byteEvents.map({ String(decoding: $0, as: UTF8.self) }) == expected else {
+            throw SSETestFailure(message: "byte-split SSE with \(newline.debugDescription) changed events")
+        }
     }
 }
 

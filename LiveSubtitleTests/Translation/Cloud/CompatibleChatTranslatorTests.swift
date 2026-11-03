@@ -107,6 +107,17 @@ private func checkEndpointRejectsUnsafeConfiguration() async throws {
     try cloudRequire(updates.count == 1, "unsafe endpoint did not close its stream")
     try cloudRequire(updates.first?.failure == .invalidConfiguration, "unsafe endpoint returned wrong failure")
     try cloudRequire(CloudURLProtocol.requests.isEmpty, "unsafe endpoint issued a request")
+
+    let secret = "synthetic secret"
+    let queryProfile = cloudProfile(endpoint: "https://provider.example/complete?code=synthetic+secret")
+    let pathProfile = cloudProfile(endpoint: "https://provider.example/synthetic%20secret")
+    let urlCredentials = CloudCredentialStoreStub(keys: [queryProfile.id: secret, pathProfile.id: secret])
+    let urlTranslator = CompatibleChatTranslator(credentials: urlCredentials, configuration: cloudConfiguration())
+    for profile in [queryProfile, pathProfile] {
+        let rejected = await cloudCollect(await urlTranslator.translate(cloudJob(profile: profile)))
+        try cloudRequire(rejected.first?.failure == .invalidConfiguration, "actual credential in URL was accepted: \(profile.endpoint)")
+    }
+    try cloudRequire(CloudURLProtocol.requests.isEmpty, "URL containing the actual credential issued a request")
 }
 
 private func checkJobDestinationIsFrozen() async throws {
@@ -211,6 +222,12 @@ private func checkJSONFallback() async throws {
 
     let refusal = await cloudRun(.json("{\"choices\":[{\"message\":{\"content\":null,\"refusal\":\"hidden\"}}]}"))
     try cloudRequire(refusal.first?.failure == .refused, "JSON refusal was not surfaced")
+
+    let truncated = await cloudRun(.json("{\"choices\":[{\"message\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}"))
+    try cloudRequire(truncated.first?.failure == .invalidOutput, "JSON truncation was finalized")
+    try cloudRequire(truncated.first?.text.isEmpty == true, "JSON truncation retained partial text")
+    let filtered = await cloudRun(.json("{\"choices\":[{\"message\":{\"content\":\"partial\"},\"finish_reason\":\"content_filter\"}]}"))
+    try cloudRequire(filtered.first?.failure == .refused, "JSON content_filter was finalized")
 
     let incompatible = await cloudRun(CloudStubResponse(
         headers: ["Content-Type": "text/plain"], chunks: [Data("plain text".utf8)]
@@ -322,6 +339,52 @@ private func checkCancellationDropsLateResults() async throws {
     try cloudRequire(consumerUpdates.isEmpty, "consumer cancellation emitted a late result or failure")
 }
 
+private func checkCancelWhileReadingCredential() async throws {
+    CloudURLProtocol.reset()
+    CloudURLProtocol.setHandler { _ in .sse("data: [DONE]\n\n") }
+    let profile = cloudProfile()
+    let credentials = CloudCredentialStoreStub(
+        keys: [profile.id: "synthetic-test-credential"], blocksRead: true
+    )
+    let translator = CompatibleChatTranslator(credentials: credentials, configuration: cloudConfiguration())
+    let pending = Task { await translator.translate(cloudJob(profile: profile)) }
+    guard await cloudTestEventually({ await credentials.readProfileIDs.count == 1 }) else {
+        throw CloudTestFailure(message: "credential read did not start")
+    }
+
+    await translator.cancelAll()
+    await credentials.releaseRead()
+    let stream = await pending.value
+    let updates = await cloudCollect(stream)
+
+    try cloudRequire(updates.isEmpty, "cancel during credential read emitted a result")
+    try cloudRequire(CloudURLProtocol.requests.isEmpty, "cancel during credential read started a request")
+}
+
+private func checkProvisionalThrottle() async throws {
+    CloudURLProtocol.reset()
+    let clock = CloudClockStub(times: [0, 99_000_000, 100_000_000])
+    let response = CloudStubResponse(chunks: [
+        Data("data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n".utf8),
+        Data("data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n".utf8),
+        Data("data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n".utf8),
+        Data("data: [DONE]\n\n".utf8)
+    ])
+    CloudURLProtocol.setHandler { _ in response }
+    let profile = cloudProfile()
+    let credentials = CloudCredentialStoreStub(keys: [profile.id: "synthetic-test-credential"])
+    let translator = CompatibleChatTranslator(
+        credentials: credentials, configuration: cloudConfiguration(), clock: clock
+    )
+
+    let updates = await cloudCollect(await translator.translate(cloudJob(profile: profile)))
+
+    let provisional = updates.filter { !$0.isFinal && $0.failure == nil }.map(\.text)
+    try cloudRequire(provisional == ["a", "abc"], "99/100 ms throttle boundary produced wrong cumulative updates: \(provisional)")
+    try cloudRequire(updates.last?.text == "abc", "throttling dropped final text")
+    try cloudRequire(updates.last?.isFinal == true, "throttling dropped final completion")
+}
+
 private func checkConnectionProbeIsFixedText() async throws {
     CloudURLProtocol.reset()
     CloudURLProtocol.setHandler { _ in .sse(
@@ -388,9 +451,11 @@ private struct CompatibleChatTranslatorHostChecks {
         try await checkLimitsAndHTTPFailures()
         try await checkEphemeralAndRedirectPrivacy()
         try await checkCancellationDropsLateResults()
+        try await checkCancelWhileReadingCredential()
+        try await checkProvisionalThrottle()
         try await checkConnectionProbeIsFixedText()
         try await checkConnectionProbeCancellation()
-        print("10 translator and connection host checks passed")
+        print("12 translator and connection host checks passed")
     }
 }
 #else
@@ -406,6 +471,8 @@ struct CompatibleChatTranslatorTests {
     @Test func testLimitsAndHTTPFailures() async throws { try await checkLimitsAndHTTPFailures() }
     @Test func testEphemeralAndRedirectPrivacy() async throws { try await checkEphemeralAndRedirectPrivacy() }
     @Test func testCancellationDropsLateResults() async throws { try await checkCancellationDropsLateResults() }
+    @Test func testCancelWhileReadingCredential() async throws { try await checkCancelWhileReadingCredential() }
+    @Test func testProvisionalThrottle() async throws { try await checkProvisionalThrottle() }
     @Test func testConnectionProbeIsFixedText() async throws { try await checkConnectionProbeIsFixedText() }
     @Test func testConnectionProbeCancellation() async throws { try await checkConnectionProbeCancellation() }
 }

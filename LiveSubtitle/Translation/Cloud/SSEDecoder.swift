@@ -8,17 +8,37 @@ struct SSEDecoder {
     private var line = Data()
     private var dataLines: [Data] = []
     private var eventByteCount = 0
+    private var afterCR = false
+    private var resetAfterCR = false
 
     mutating func append(_ chunk: Data) throws -> [Data] {
         var events: [Data] = []
         for byte in chunk {
+            if afterCR {
+                afterCR = false
+                if byte == 0x0A {
+                    eventByteCount += 1
+                    guard eventByteCount <= RuntimePolicy.sseEventByteLimit else {
+                        throw SSEDecoderError.eventTooLarge
+                    }
+                    if resetAfterCR { eventByteCount = 0 }
+                    resetAfterCR = false
+                    continue
+                }
+                if resetAfterCR { eventByteCount = 0 }
+                resetAfterCR = false
+            }
             eventByteCount += 1
             guard eventByteCount <= RuntimePolicy.sseEventByteLimit else {
                 throw SSEDecoderError.eventTooLarge
             }
-            if byte == 0x0A {
-                try processLine(&events)
-            } else {
+            switch byte {
+            case 0x0D:
+                resetAfterCR = try processLine(&events)
+                afterCR = true
+            case 0x0A:
+                if try processLine(&events) { eventByteCount = 0 }
+            default:
                 line.append(byte)
             }
         }
@@ -29,15 +49,15 @@ struct SSEDecoder {
         line.removeAll(keepingCapacity: false)
         dataLines.removeAll(keepingCapacity: false)
         eventByteCount = 0
+        afterCR = false
+        resetAfterCR = false
         return []
     }
 
-    private mutating func processLine(_ events: inout [Data]) throws {
-        if line.last == 0x0D { line.removeLast() }
+    private mutating func processLine(_ events: inout [Data]) throws -> Bool {
         defer { line.removeAll(keepingCapacity: true) }
         if line.isEmpty {
-            eventByteCount = 0
-            guard !dataLines.isEmpty else { return }
+            guard !dataLines.isEmpty else { return true }
             var event = Data()
             for (index, dataLine) in dataLines.enumerated() {
                 if index > 0 { event.append(0x0A) }
@@ -45,9 +65,9 @@ struct SSEDecoder {
             }
             dataLines.removeAll(keepingCapacity: true)
             events.append(event)
-            return
+            return true
         }
-        guard line.first != 0x3A else { return }
+        guard line.first != 0x3A else { return false }
         let field: Data
         var value = Data()
         if let colon = line.firstIndex(of: 0x3A) {
@@ -63,5 +83,6 @@ struct SSEDecoder {
         if String(decoding: field, as: UTF8.self) == "data" {
             dataLines.append(value)
         }
+        return false
     }
 }

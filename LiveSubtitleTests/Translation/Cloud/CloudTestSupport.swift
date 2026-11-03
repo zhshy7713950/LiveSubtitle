@@ -142,15 +142,28 @@ final class CloudURLProtocol: URLProtocol, @unchecked Sendable {
 
 actor CloudCredentialStoreStub: CredentialStoring {
     private var keys: [UUID: String]
+    private let blocksRead: Bool
+    private var readContinuation: CheckedContinuation<Void, Never>?
     private(set) var readProfileIDs: [UUID] = []
 
-    init(keys: [UUID: String]) {
+    init(keys: [UUID: String], blocksRead: Bool = false) {
         self.keys = keys
+        self.blocksRead = blocksRead
     }
 
     func readKey(profileID: UUID) async throws -> String? {
         readProfileIDs.append(profileID)
+        if blocksRead {
+            await withCheckedContinuation { continuation in
+                readContinuation = continuation
+            }
+        }
         return keys[profileID]
+    }
+
+    func releaseRead() {
+        readContinuation?.resume()
+        readContinuation = nil
     }
 
     func replaceKey(_ key: String, profileID: UUID) async throws {
@@ -163,6 +176,32 @@ actor CloudCredentialStoreStub: CredentialStoring {
 
     func clearAppNamespace() async throws {
         keys.removeAll()
+    }
+}
+
+final class CloudClockStub: MonotonicClock {
+    private struct State {
+        var times: [UInt64]
+        var index = 0
+    }
+
+    private let state: Mutex<State>
+
+    init(times: [UInt64] = [0]) {
+        state = Mutex(State(times: times.isEmpty ? [0] : times))
+    }
+
+    func now() -> MonotonicInstant {
+        let value = state.withLock { state -> UInt64 in
+            let value = state.times[min(state.index, state.times.count - 1)]
+            state.index += 1
+            return value
+        }
+        return MonotonicInstant(uptimeNanoseconds: value)
+    }
+
+    func sleep(until deadline: MonotonicInstant) async throws {
+        throw CancellationError()
     }
 }
 

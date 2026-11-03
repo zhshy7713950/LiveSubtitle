@@ -21,14 +21,24 @@ actor CompatibleChatTranslator: Translator {
     private let credentials: any CredentialStoring
     private let session: URLSession
     private let redirectPolicy: CloudRedirectPolicy
+    private let clock: any MonotonicClock
     private var jobs: [UUID: JobWork] = [:]
 
-    init(credentials: any CredentialStoring) {
-        self.init(credentials: credentials, configuration: Self.makeEphemeralConfiguration())
+    init(credentials: any CredentialStoring, clock: any MonotonicClock = CloudSystemClock()) {
+        self.init(
+            credentials: credentials,
+            configuration: Self.makeEphemeralConfiguration(),
+            clock: clock
+        )
     }
 
-    init(credentials: any CredentialStoring, configuration: URLSessionConfiguration) {
+    init(
+        credentials: any CredentialStoring,
+        configuration: URLSessionConfiguration,
+        clock: any MonotonicClock = CloudSystemClock()
+    ) {
         self.credentials = credentials
+        self.clock = clock
         let policy = CloudRedirectPolicy()
         self.redirectPolicy = policy
         self.session = URLSession(
@@ -57,26 +67,34 @@ actor CompatibleChatTranslator: Translator {
         let (stream, continuation) = AsyncStream<TranslationUpdate>.makeStream(
             bufferingPolicy: .bufferingOldest(1)
         )
+        jobs[job.jobID] = JobWork(continuation: continuation)
+        continuation.onTermination = { [weak self] reason in
+            guard case .cancelled = reason else { return }
+            Task { await self?.cancelJob(job.jobID) }
+        }
         guard let profile = job.cloudProfile,
               profile.revision == job.identity.cloudConfigRevision,
-              EndpointValidator.validationFailure(for: profile) == nil,
-              let key = try? await credentials.readKey(profileID: profile.id),
-              !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            continuation.yield(Self.failureUpdate(for: job, reason: .invalidConfiguration))
-            continuation.finish()
+              EndpointValidator.validationFailure(for: profile) == nil else {
+            reject(job)
+            return stream
+        }
+        let key = try? await credentials.readKey(profileID: profile.id)
+        guard jobs[job.jobID] != nil, !Task.isCancelled else {
+            finishJob(job.jobID)
+            return stream
+        }
+        guard let key,
+              !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !Self.urlContainsCredential(profile.endpoint, key: key) else {
+            reject(job)
             return stream
         }
         let request = Self.makeRequest(job: job, profile: profile, key: key)
-        jobs[job.jobID] = JobWork(continuation: continuation)
         let task = Task { [weak self] in
             guard let self else { return }
             await self.run(job, request: request, continuation: continuation)
         }
         jobs[job.jobID]?.task = task
-        continuation.onTermination = { [weak self] reason in
-            guard case .cancelled = reason else { return }
-            Task { await self?.cancelJob(job.jobID) }
-        }
         return stream
     }
 
@@ -154,8 +172,7 @@ actor CompatibleChatTranslator: Translator {
         var buffer = Data()
         var consumption = Consumption(text: "", finished: false)
         var responseByteCount = 0
-        var lastEmission: ContinuousClock.Instant?
-        let clock = ContinuousClock()
+        var lastEmission: MonotonicInstant?
         for try await byte in bytes {
             responseByteCount += 1
             guard responseByteCount <= RuntimePolicy.responseByteLimit else {
@@ -186,8 +203,8 @@ actor CompatibleChatTranslator: Translator {
         consumption: Consumption,
         job: TranslationJob,
         continuation: AsyncStream<TranslationUpdate>.Continuation,
-        clock: ContinuousClock,
-        lastEmission: inout ContinuousClock.Instant?
+        clock: any MonotonicClock,
+        lastEmission: inout MonotonicInstant?
     ) throws -> Consumption {
         var consumption = consumption
         for event in try decoder.append(data) {
@@ -240,12 +257,17 @@ actor CompatibleChatTranslator: Translator {
         _ text: String,
         job: TranslationJob,
         continuation: AsyncStream<TranslationUpdate>.Continuation,
-        clock: ContinuousClock,
-        lastEmission: inout ContinuousClock.Instant?
+        clock: any MonotonicClock,
+        lastEmission: inout MonotonicInstant?
     ) {
-        let now = clock.now
-        if let lastEmission, lastEmission.duration(to: now) < RuntimePolicy.translationDisplayInterval {
-            return
+        let now = clock.now()
+        if let lastEmission {
+            let elapsed = now.uptimeNanoseconds >= lastEmission.uptimeNanoseconds
+                ? now.uptimeNanoseconds - lastEmission.uptimeNanoseconds
+                : 0
+            if elapsed < Self.nanoseconds(for: RuntimePolicy.translationDisplayInterval) {
+                return
+            }
         }
         guard jobs[job.jobID] != nil else { return }
         continuation.yield(TranslationUpdate(
@@ -270,10 +292,18 @@ actor CompatibleChatTranslator: Translator {
         } catch {
             throw TransportError.incompatibleResponse
         }
-        guard let message = response.choices.first?.message else {
+        guard let choice = response.choices.first, let message = choice.message else {
             throw TransportError.incompatibleResponse
         }
         if message.refusal != nil { throw TransportError.refused }
+        switch choice.finishReason {
+        case nil, "stop":
+            break
+        case "content_filter":
+            throw TransportError.refused
+        default:
+            throw TransportError.invalidOutput
+        }
         guard let text = message.content,
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw TransportError.invalidOutput
@@ -282,6 +312,12 @@ actor CompatibleChatTranslator: Translator {
             throw TransportError.invalidOutput
         }
         return text
+    }
+
+    private func reject(_ job: TranslationJob) {
+        guard let work = jobs.removeValue(forKey: job.jobID) else { return }
+        work.continuation.yield(Self.failureUpdate(for: job, reason: .invalidConfiguration))
+        work.continuation.finish()
     }
 
     private func finishJob(_ jobID: UUID) {
@@ -315,12 +351,31 @@ actor CompatibleChatTranslator: Translator {
         return request
     }
 
+    private static func urlContainsCredential(_ url: URL, key: String) -> Bool {
+        let absolute = url.absoluteString
+        if absolute.contains(key) || absolute.removingPercentEncoding?.contains(key) == true {
+            return true
+        }
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        return components?.queryItems?.contains { item in
+            let name = item.name.replacingOccurrences(of: "+", with: " ")
+            let value = item.value?.replacingOccurrences(of: "+", with: " ")
+            return name.contains(key) || value?.contains(key) == true
+        } ?? false
+    }
+
     private static func languageName(_ language: LanguageIdentifier) -> String {
         switch language.rawValue {
         case "en": "English"
         case "zh-Hans": "Simplified Chinese"
         default: language.rawValue
         }
+    }
+
+    private static func nanoseconds(for duration: Duration) -> UInt64 {
+        let components = duration.components
+        return UInt64(components.seconds) * 1_000_000_000
+            + UInt64(components.attoseconds / 1_000_000_000)
     }
 
     private static func failure(for error: TransportError) -> FailureCode {
@@ -344,6 +399,20 @@ actor CompatibleChatTranslator: Translator {
             sourceRevision: job.sourceRevision, text: "", isFinal: false,
             provider: .ai, failure: reason
         )
+    }
+}
+
+struct CloudSystemClock: MonotonicClock {
+    func now() -> MonotonicInstant {
+        MonotonicInstant(
+            uptimeNanoseconds: UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000_000)
+        )
+    }
+
+    func sleep(until deadline: MonotonicInstant) async throws {
+        let current = now().uptimeNanoseconds
+        guard deadline.uptimeNanoseconds > current else { return }
+        try await Task.sleep(nanoseconds: deadline.uptimeNanoseconds - current)
     }
 }
 
@@ -380,6 +449,12 @@ private struct JSONChatResponse: Decodable {
             let refusal: String?
         }
         let message: Message?
+        let finishReason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case message
+            case finishReason = "finish_reason"
+        }
     }
     let choices: [Choice]
 
