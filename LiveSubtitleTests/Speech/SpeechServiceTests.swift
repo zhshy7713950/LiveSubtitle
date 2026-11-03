@@ -219,6 +219,152 @@ struct SpeechServiceTests {
         #expect(transcripts[0].utteranceID != transcripts[1].utteranceID)
         #expect(transcripts.map(\.revision) == [0, 0])
     }
+
+    @Test
+    func testBackpressuredProducerCancellation() async {
+        let channel = BoundedEventChannel<Int>()
+        for value in 0..<32 { await channel.send(value) }
+        let probe = SpeechCompletionProbe()
+        let producer = Task {
+            await channel.send(32)
+            await probe.markCompleted()
+        }
+        producer.cancel()
+        for _ in 0..<100 {
+            if await probe.isCompleted() { break }
+            await Task.yield()
+        }
+        await channel.cancel()
+        #expect(await probe.isCompleted())
+    }
+
+    @Test
+    func testRestartRejectedUntilOldCancellationCompletes() async throws {
+        let backend = SpeechBackendStub(
+            events: [],
+            emitsAutomatically: false,
+            waitsForCancelRelease: true
+        )
+        let service = SpeechService(
+            backendFactory: SpeechBackendFactoryStub(backend: backend),
+            clock: SpeechTestClock()
+        )
+        let firstOutput = try await service.start(input: emptyAudioInput(), source: LanguageIdentifier(rawValue: "en"))
+        let cancellation = Task { await service.cancelAndFinish() }
+        while await backend.lifecycleCounts().cancel == 0 { await Task.yield() }
+
+        await #expect(throws: FailureCode.unavailable) {
+            _ = try await service.start(input: emptyAudioInput(), source: LanguageIdentifier(rawValue: "en"))
+        }
+        await backend.releaseCancellation()
+        await cancellation.value
+        for await _ in firstOutput {}
+        let secondOutput = try await service.start(input: emptyAudioInput(), source: LanguageIdentifier(rawValue: "en"))
+        await service.cancelAndFinish()
+        for await _ in secondOutput {}
+    }
+
+    @Test
+    func testDiscontinuityRestartReplaysChunk() {
+        var state = SpeechRestartState()
+        let initialGeneration = state.generation
+        let chunk = AudioChunk(
+            sequence: 99,
+            capturePTS: AudioTimestamp(value: 32_000, timescale: 16_000),
+            frameCount: 4,
+            sampleRate: 16_000,
+            channels: 1,
+            format: PCMFormat(
+                sampleFormat: .signedInt16,
+                isInterleaved: true,
+                isBigEndian: false,
+                bytesPerFrame: 2
+            ),
+            ownedPCM: [Data(repeating: 0, count: 8)],
+            discontinuity: true
+        )
+
+        let nextGeneration = state.requestRestart(replaying: chunk)
+        #expect(nextGeneration == initialGeneration + 1)
+        #expect(state.takePendingChunk()?.sequence == 99)
+        #expect(state.takePendingChunk() == nil)
+    }
+
+    @Test
+    func testEmptyFinalRevisesExistingUtterance() async throws {
+        let range = audioRange(start: 0, end: 1_000)
+        let provisional = SpeechRawResult(
+            audioRange: range,
+            text: "temporary",
+            spans: [],
+            isFinal: false
+        )
+        let emptyFinal = SpeechRawResult(audioRange: range, text: "", spans: [], isFinal: true)
+        let backend = SpeechBackendStub(events: [.result(provisional), .result(emptyFinal), .ended])
+        let service = SpeechService(
+            backendFactory: SpeechBackendFactoryStub(backend: backend),
+            clock: SpeechTestClock()
+        )
+        let output = try await service.start(input: emptyAudioInput(), source: LanguageIdentifier(rawValue: "en"))
+        var transcripts: [TranscriptEvent] = []
+        for await event in output {
+            if case .transcript(let transcript) = event { transcripts.append(transcript) }
+        }
+
+        #expect(transcripts.count == 2)
+        guard transcripts.count == 2 else { return }
+        #expect(transcripts[0].utteranceID == transcripts[1].utteranceID)
+        #expect(transcripts[1].revision == 1)
+        #expect(transcripts[1].text.isEmpty)
+        #expect(transcripts[1].isFinal)
+    }
+
+    @Test
+    func testIncompleteTimingResetsAtWindowLimit() async throws {
+        let partialTiming = SpeechRawResult(
+            audioRange: audioRange(start: 0, end: 29_000),
+            text: String(repeating: "a", count: RuntimePolicy.transcriptWindowCharacterLimit),
+            spans: [
+                transcriptSpan(characters: 0..<1, start: 0, end: 1),
+                transcriptSpan(
+                    characters: (RuntimePolicy.transcriptWindowCharacterLimit - 1)..<RuntimePolicy.transcriptWindowCharacterLimit,
+                    start: 28_999,
+                    end: 29_000
+                )
+            ],
+            isFinal: false
+        )
+        let expiredTiming = SpeechRawResult(
+            audioRange: audioRange(start: 0, end: 40_000),
+            text: "short",
+            spans: [transcriptSpan(characters: 0..<5, start: 0, end: 1_000)],
+            isFinal: false
+        )
+        let backend = SpeechBackendStub(events: [.result(partialTiming), .result(expiredTiming), .ended])
+        let service = SpeechService(
+            backendFactory: SpeechBackendFactoryStub(backend: backend),
+            clock: SpeechTestClock()
+        )
+        let output = try await service.start(input: emptyAudioInput(), source: LanguageIdentifier(rawValue: "en"))
+        var discontinuities = 0
+        var transcripts: [TranscriptEvent] = []
+        for await event in output {
+            switch event {
+            case .discontinuity: discontinuities += 1
+            case .transcript(let transcript): transcripts.append(transcript)
+            default: break
+            }
+        }
+
+        #expect(discontinuities == 2)
+        #expect(transcripts.isEmpty)
+    }
+}
+
+private actor SpeechCompletionProbe {
+    private var completed = false
+    func markCompleted() { completed = true }
+    func isCompleted() -> Bool { completed }
 }
 
 private func emptyAudioInput() -> AsyncStream<AudioSourceEvent> {
@@ -250,6 +396,8 @@ private actor SpeechBackendStub: SpeechBackendDriving {
     let events: [SpeechRawEvent]
     let emitsAutomatically: Bool
     let lateResultOnCancel: SpeechRawResult?
+    let waitsForCancelRelease: Bool
+    private var cancellationContinuation: CheckedContinuation<Void, Never>?
     private var continuation: AsyncStream<SpeechRawEvent>.Continuation?
     private var resetCount = 0
     private var finishCount = 0
@@ -258,11 +406,13 @@ private actor SpeechBackendStub: SpeechBackendDriving {
     init(
         events: [SpeechRawEvent],
         emitsAutomatically: Bool = true,
-        lateResultOnCancel: SpeechRawResult? = nil
+        lateResultOnCancel: SpeechRawResult? = nil,
+        waitsForCancelRelease: Bool = false
     ) {
         self.events = events
         self.emitsAutomatically = emitsAutomatically
         self.lateResultOnCancel = lateResultOnCancel
+        self.waitsForCancelRelease = waitsForCancelRelease
     }
 
     func inputFormat(source: LanguageIdentifier) async throws -> AudioFormat {
@@ -302,6 +452,16 @@ private actor SpeechBackendStub: SpeechBackendDriving {
         if let lateResultOnCancel { continuation?.yield(.result(lateResultOnCancel)) }
         continuation?.finish()
         continuation = nil
+        if waitsForCancelRelease && cancelCount == 1 {
+            await withCheckedContinuation { continuation in
+                cancellationContinuation = continuation
+            }
+        }
+    }
+
+    func releaseCancellation() {
+        cancellationContinuation?.resume()
+        cancellationContinuation = nil
     }
 
     func lifecycleCounts() -> (reset: Int, finish: Int, cancel: Int) {

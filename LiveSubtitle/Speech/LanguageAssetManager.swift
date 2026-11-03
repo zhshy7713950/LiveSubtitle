@@ -27,6 +27,8 @@ final class LanguageAssetManager: LanguageAssetManaging {
     @ObservationIgnored private var preparationTask: Task<Void, Never>?
     @ObservationIgnored private var continuation: AsyncStream<AssetEvent>.Continuation?
     @ObservationIgnored private var translationContinuation: CheckedContinuation<Bool, Never>?
+    @ObservationIgnored private var completedTranslationID: UUID?
+    @ObservationIgnored private var releaseTask: Task<Void, Never>?
 
     init(
         recognition: any RecognitionAssetProviding = SystemRecognitionAssetProvider(),
@@ -44,6 +46,7 @@ final class LanguageAssetManager: LanguageAssetManaging {
 
     func prepare(source: LanguageIdentifier, target: LanguageIdentifier) -> AsyncStream<AssetEvent> {
         cancelPreparation()
+        scheduleReservationRelease()
         let id = UUID()
         preparationID = id
         let stream = AsyncStream<AssetEvent>(bufferingPolicy: .bufferingNewest(8)) { continuation in
@@ -69,22 +72,25 @@ final class LanguageAssetManager: LanguageAssetManaging {
         preparationTask = nil
         translationContinuation?.resume(returning: false)
         translationContinuation = nil
+        completedTranslationID = nil
         continuation?.yield(.cancelled)
         continuation?.finish()
         continuation = nil
-        let recognition = recognition
-        Task { await recognition.releaseReservations() }
+        scheduleReservationRelease()
     }
 
     func releaseReservations() async {
         cancelPreparation()
-        await recognition.releaseReservations()
+        scheduleReservationRelease()
+        await releaseTask?.value
+        releaseTask = nil
     }
 
     var preparationToken: UUID? { preparationID }
 
     func completeTranslationPreparation(token: UUID?) {
         guard preparationID != nil, preparationID == token else { return }
+        completedTranslationID = token
         translationContinuation?.resume(returning: true)
         translationContinuation = nil
     }
@@ -100,6 +106,8 @@ final class LanguageAssetManager: LanguageAssetManaging {
 
     private func runPreparation(id: UUID, source: LanguageIdentifier, target: LanguageIdentifier) async {
         do {
+            await releaseTask?.value
+            releaseTask = nil
             try Task.checkCancellation()
             var current = await status(source: source, target: target)
             guard preparationID == id else { return }
@@ -129,8 +137,14 @@ final class LanguageAssetManager: LanguageAssetManaging {
             }
             try Task.checkCancellation()
             if current.localTranslation == .preparing {
-                let prepared = await withCheckedContinuation { continuation in
-                    translationContinuation = continuation
+                let prepared: Bool
+                if completedTranslationID == id {
+                    completedTranslationID = nil
+                    prepared = true
+                } else {
+                    prepared = await withCheckedContinuation { continuation in
+                        translationContinuation = continuation
+                    }
                 }
                 guard prepared else { throw FailureCode.preparationCancelled }
             }
@@ -156,6 +170,7 @@ final class LanguageAssetManager: LanguageAssetManaging {
         guard preparationID == id else { return }
         preparationID = nil
         translationConfiguration = nil
+        completedTranslationID = nil
         preparationTask = nil
         continuation?.yield(.finished)
         continuation?.finish()
@@ -166,20 +181,24 @@ final class LanguageAssetManager: LanguageAssetManaging {
         guard preparationID == id else { return }
         preparationID = nil
         translationConfiguration = nil
+        completedTranslationID = nil
         preparationTask = nil
         translationContinuation?.resume(returning: false)
         translationContinuation = nil
         continuation?.yield(.failed(code))
         continuation?.finish()
         continuation = nil
-        let recognition = recognition
-        Task { await recognition.releaseReservations() }
+        scheduleReservationRelease()
+    }
+
+    private func scheduleReservationRelease() {
+        guard releaseTask == nil else { return }
+        releaseTask = Task { await recognition.releaseReservations() }
     }
 }
 
 actor SystemRecognitionAssetProvider: RecognitionAssetProviding {
-    private var reservedLocale: Locale?
-    private var ownsReservation = false
+    private var ownedReservations: Set<Locale> = []
 
     func status(source: LanguageIdentifier) async -> AssetState {
         await SystemSpeechCapabilityProvider().recognitionStatus(source: source)
@@ -194,8 +213,7 @@ actor SystemRecognitionAssetProvider: RecognitionAssetProviding {
         let existing = await AssetInventory.reservedLocales
         if !existing.contains(locale) {
             _ = try await AssetInventory.reserve(locale: locale)
-            reservedLocale = locale
-            ownsReservation = true
+            ownedReservations.insert(locale)
         }
         try Task.checkCancellation()
         if let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
@@ -208,9 +226,10 @@ actor SystemRecognitionAssetProvider: RecognitionAssetProviding {
     }
 
     func releaseReservations() async {
-        guard ownsReservation, let reservedLocale else { return }
-        ownsReservation = false
-        self.reservedLocale = nil
-        _ = await AssetInventory.release(reservedLocale: reservedLocale)
+        let reservations = ownedReservations
+        ownedReservations.removeAll()
+        for locale in reservations {
+            _ = await AssetInventory.release(reservedLocale: locale)
+        }
     }
 }

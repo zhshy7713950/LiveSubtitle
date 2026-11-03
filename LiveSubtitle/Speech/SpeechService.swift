@@ -58,7 +58,10 @@ actor SpeechService: SpeechRecognizing {
     private var resultTask: Task<Void, Never>?
     private var channel: BoundedEventChannel<SpeechEvent>?
     private var normalizer = SpeechResultNormalizer()
+    private var generation: UInt64 = 0
     private var isActive = false
+    private var isStarting = false
+    private var isStopping = false
 
     init() {
         self.backendFactory = SystemSpeechBackendFactory()
@@ -78,52 +81,78 @@ actor SpeechService: SpeechRecognizing {
         input: AsyncStream<AudioSourceEvent>,
         source: LanguageIdentifier
     ) async throws -> AsyncStream<SpeechEvent> {
-        guard !isActive else { throw FailureCode.unavailable }
+        guard !isActive, !isStarting, !isStopping else { throw FailureCode.unavailable }
+        isStarting = true
+        generation &+= 1
+        let token = generation
         let backend = backendFactory.makeBackend()
-        let rawStream = try await backend.start(input: input, source: source)
+        let rawStream: AsyncStream<SpeechRawEvent>
+        do {
+            rawStream = try await backend.start(input: input, source: source)
+        } catch {
+            if generation == token { isStarting = false }
+            throw error
+        }
         let channel = BoundedEventChannel<SpeechEvent>()
         self.backend = backend
         self.channel = channel
         normalizer.reset()
         isActive = true
+        isStarting = false
         resultTask = Task { [weak self] in
             guard let self else { return }
             for await event in rawStream {
-                await self.receive(event)
+                await self.receive(event, generation: token)
             }
-            await self.rawStreamEnded()
+            await self.rawStreamEnded(generation: token)
         }
         return channel.makeStream { [weak self] in
-            Task { await self?.outputTerminated() }
+            Task { await self?.outputTerminated(generation: token) }
         }
     }
 
     func finish() async {
-        guard isActive, let backend else { return }
+        guard isActive, !isStopping, let backend else { return }
+        let token = generation
+        let resultTask = resultTask
+        isStopping = true
         await backend.finish()
         await resultTask?.value
-        resultTask = nil
-        self.backend = nil
-        channel = nil
+        if generation == token {
+            self.resultTask = nil
+            self.backend = nil
+            channel = nil
+            isActive = false
+            isStopping = false
+        }
     }
 
     func cancelAndFinish() async {
-        guard isActive else { return }
+        guard isActive, !isStopping else { return }
+        let token = generation
+        let backend = backend
+        let resultTask = resultTask
+        let channel = channel
         isActive = false
+        isStopping = true
         normalizer.reset()
         resultTask?.cancel()
-        await backend?.cancelAndFinish()
-        resultTask = nil
-        backend = nil
         await channel?.cancel()
-        channel = nil
+        await backend?.cancelAndFinish()
+        await resultTask?.value
+        if generation == token {
+            self.resultTask = nil
+            self.backend = nil
+            self.channel = nil
+            isStopping = false
+        }
     }
 
-    private func receive(_ event: SpeechRawEvent) async {
-        guard isActive else { return }
+    private func receive(_ event: SpeechRawEvent, generation token: UInt64) async {
+        guard isActive, generation == token else { return }
         switch event {
         case .result(let raw):
-            await receive(raw)
+            await receive(raw, generation: token)
         case .discontinuity(let timestamp):
             normalizer.reset()
             await channel?.send(.discontinuity(timestamp))
@@ -140,9 +169,11 @@ actor SpeechService: SpeechRecognizing {
         }
     }
 
-    private func receive(_ raw: SpeechRawResult) async {
-        guard !raw.text.isEmpty else { return }
-        if raw.exceedsWindow && !raw.hasCompleteTiming {
+    private func receive(_ raw: SpeechRawResult, generation token: UInt64) async {
+        guard isActive, generation == token else { return }
+        if raw.text.isEmpty && !normalizer.hasCurrentUtterance { return }
+        let bounded = raw.boundedToWindow()
+        if raw.exceedsWindow && (!raw.hasCompleteTiming || bounded == nil) {
             normalizer.reset()
             await channel?.send(.discontinuity(raw.audioRange.start))
             do {
@@ -154,7 +185,7 @@ actor SpeechService: SpeechRecognizing {
             }
             return
         }
-        let bounded = raw.boundedToWindow()
+        guard let bounded else { return }
         guard let transcript = normalizer.normalize(
             raw: bounded,
             receivedAt: clock.now()
@@ -162,16 +193,16 @@ actor SpeechService: SpeechRecognizing {
         await channel?.send(.transcript(transcript))
     }
 
-    private func rawStreamEnded() async {
-        guard isActive else { return }
+    private func rawStreamEnded(generation token: UInt64) async {
+        guard isActive, generation == token else { return }
         isActive = false
         normalizer.reset()
         await channel?.send(.failed(.speechFailed))
         await channel?.finish()
     }
 
-    private func outputTerminated() async {
-        guard isActive else { return }
+    private func outputTerminated(generation token: UInt64) async {
+        guard isActive, generation == token else { return }
         await cancelAndFinish()
     }
 }
@@ -181,6 +212,8 @@ private struct SpeechResultNormalizer {
     private var previousRange: AudioRange?
     private var revision: UInt64 = 0
     private var previousWasFinal = false
+
+    var hasCurrentUtterance: Bool { utteranceID != nil }
 
     mutating func reset() {
         utteranceID = nil
@@ -234,11 +267,28 @@ private extension SpeechRawResult {
     }
 
     var hasCompleteTiming: Bool {
-        guard let first = spans.first, let last = spans.last else { return false }
-        return first.characterRange.lowerBound == 0 && last.characterRange.upperBound == text.count
+        guard isValid(audioRange) else { return false }
+        var expectedCharacter = 0
+        var previousAudioEnd = 0.0
+        for span in spans {
+            guard span.characterRange.lowerBound == expectedCharacter,
+                  span.characterRange.lowerBound < span.characterRange.upperBound,
+                  span.characterRange.upperBound <= text.count,
+                  isValid(span.audioRange),
+                  seconds(span.audioRange.start) >= previousAudioEnd else { return false }
+            expectedCharacter = span.characterRange.upperBound
+            previousAudioEnd = seconds(span.audioRange.end)
+        }
+        return expectedCharacter == text.count
     }
 
-    func boundedToWindow() -> SpeechRawResult {
+    private func isValid(_ range: AudioRange) -> Bool {
+        range.start.timescale > 0 && range.end.timescale > 0 &&
+            range.start.value >= 0 && range.end.value >= 0 &&
+            seconds(range.start) <= seconds(range.end)
+    }
+
+    func boundedToWindow() -> SpeechRawResult? {
         var startIndex = text.startIndex
         if text.count > RuntimePolicy.transcriptWindowCharacterLimit {
             startIndex = text.index(
@@ -247,8 +297,10 @@ private extension SpeechRawResult {
             )
         }
         let cutoff = seconds(audioRange.end) - Double(RuntimePolicy.transcriptWindowDuration.components.seconds)
-        if seconds(audioRange.start) < cutoff,
-           let firstRetained = spans.first(where: { seconds($0.audioRange.end) > cutoff }) {
+        if seconds(audioRange.start) < cutoff {
+            guard let firstRetained = spans.first(where: { seconds($0.audioRange.end) > cutoff }) else {
+                return nil
+            }
             let index = text.index(text.startIndex, offsetBy: firstRetained.characterRange.lowerBound)
             startIndex = max(startIndex, index)
         }
@@ -261,6 +313,7 @@ private extension SpeechRawResult {
             guard lower < upper else { return nil }
             return TranscriptSpan(characterRange: lower..<upper, audioRange: span.audioRange)
         }
+        guard !retainedSpans.isEmpty else { return nil }
         let retainedStart = retainedSpans.first?.audioRange.start ?? audioRange.start
         return SpeechRawResult(
             audioRange: AudioRange(start: retainedStart, end: audioRange.end),
@@ -271,12 +324,13 @@ private extension SpeechRawResult {
     }
 }
 
-private actor BoundedEventChannel<Event: Sendable> {
+actor BoundedEventChannel<Event: Sendable> {
     private let eventLimit = 32
     private var events: [Event] = []
     private var waiters: [UUID: CheckedContinuation<Event?, Never>] = [:]
     private var waiterOrder: [UUID] = []
-    private var spaceWaiters: [CheckedContinuation<Void, Never>] = []
+    private var spaceWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var spaceWaiterOrder: [UUID] = []
     private var terminated = false
     private var cancelled = false
 
@@ -309,12 +363,18 @@ private actor BoundedEventChannel<Event: Sendable> {
     }
 
     func send(_ event: Event) async {
-        while events.count >= eventLimit && !terminated {
-            await withCheckedContinuation { continuation in
-                spaceWaiters.append(continuation)
+        while events.count >= eventLimit && !terminated && !Task.isCancelled {
+            let id = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    spaceWaiters[id] = continuation
+                    spaceWaiterOrder.append(id)
+                }
+            } onCancel: {
+                Task { await self.cancelSpaceWaiter(id: id) }
             }
         }
-        guard !terminated else { return }
+        guard !terminated, !Task.isCancelled else { return }
         events.append(event)
         drainWaiters()
     }
@@ -354,8 +414,9 @@ private actor BoundedEventChannel<Event: Sendable> {
     private func takeEvent() -> Event? {
         guard !events.isEmpty else { return nil }
         let event = events.removeFirst()
-        if !spaceWaiters.isEmpty {
-            spaceWaiters.removeFirst().resume()
+        if !spaceWaiterOrder.isEmpty {
+            let id = spaceWaiterOrder.removeFirst()
+            spaceWaiters.removeValue(forKey: id)?.resume()
         }
         return event
     }
@@ -379,9 +440,35 @@ private actor BoundedEventChannel<Event: Sendable> {
     }
 
     private func resumeSpaceWaiters() {
-        let continuations = spaceWaiters
+        let continuations = spaceWaiters.values
         spaceWaiters.removeAll()
+        spaceWaiterOrder.removeAll()
         for continuation in continuations { continuation.resume() }
+    }
+
+    private func cancelSpaceWaiter(id: UUID) {
+        spaceWaiters.removeValue(forKey: id)?.resume()
+        spaceWaiterOrder.removeAll { $0 == id }
+    }
+}
+
+struct SpeechRestartState {
+    private(set) var generation = 0
+    private var pendingChunk: AudioChunk?
+
+    mutating func advance() -> Int {
+        generation += 1
+        return generation
+    }
+
+    mutating func requestRestart(replaying chunk: AudioChunk) -> Int {
+        pendingChunk = chunk
+        return advance()
+    }
+
+    mutating func takePendingChunk() -> AudioChunk? {
+        defer { pendingChunk = nil }
+        return pendingChunk
     }
 }
 
@@ -394,7 +481,8 @@ private actor SystemSpeechBackend: SpeechBackendDriving {
     private var input: AsyncStream<AudioSourceEvent>?
     private var resultTask: Task<Void, Never>?
     private var channel: BoundedEventChannel<SpeechRawEvent>?
-    private var generation = 0
+    private var restartState = SpeechRestartState()
+    private var generation: Int { restartState.generation }
     private var samplePosition: Int64 = 0
     private var isActive = false
     private var isFinishing = false
@@ -422,7 +510,7 @@ private actor SystemSpeechBackend: SpeechBackendDriving {
         self.format = format
         self.channel = channel
         self.input = input
-        generation += 1
+        _ = restartState.advance()
         samplePosition = 0
         isFinishing = false
         isActive = true
@@ -432,7 +520,8 @@ private actor SystemSpeechBackend: SpeechBackendDriving {
                 inputSequence: SystemAnalyzerInputs(
                     backend: self,
                     generation: generation,
-                    input: input
+                    input: input,
+                    pendingChunk: nil
                 )
             )
             startResults(generation: generation)
@@ -446,9 +535,12 @@ private actor SystemSpeechBackend: SpeechBackendDriving {
     }
 
     func reset() async throws {
-        guard isActive, let source, let input else { return }
-        generation += 1
-        let nextGeneration = generation
+        let nextGeneration = restartState.advance()
+        try await restart(generation: nextGeneration)
+    }
+
+    private func restart(generation nextGeneration: Int) async throws {
+        guard isActive, generation == nextGeneration, let source, let input else { return }
         resultTask?.cancel()
         await analyzer?.cancelAndFinishNow()
         await resultTask?.value
@@ -468,7 +560,8 @@ private actor SystemSpeechBackend: SpeechBackendDriving {
                 inputSequence: SystemAnalyzerInputs(
                     backend: self,
                     generation: nextGeneration,
-                    input: input
+                    input: input,
+                    pendingChunk: restartState.takePendingChunk()
                 )
             )
             startResults(generation: nextGeneration)
@@ -505,14 +598,15 @@ private actor SystemSpeechBackend: SpeechBackendDriving {
         guard isActive || analyzer != nil else { return }
         isActive = false
         isFinishing = false
-        generation += 1
+        _ = restartState.advance()
+        _ = restartState.takePendingChunk()
         resultTask?.cancel()
+        await channel?.cancel()
         await analyzer?.cancelAndFinishNow()
         await resultTask?.value
         resultTask = nil
         analyzer = nil
         input = nil
-        await channel?.cancel()
         channel = nil
     }
 
@@ -604,16 +698,18 @@ private actor SystemSpeechBackend: SpeechBackendDriving {
 
     fileprivate func nextInput(
         _ event: AudioSourceEvent,
-        generation: Int
+        generation: Int,
+        isReplay: Bool = false
     ) async -> AnalyzerInput? {
         guard isCurrent(generation), !Task.isCancelled else { return nil }
         switch event {
         case .chunk(let chunk):
-            if chunk.discontinuity {
+            if chunk.discontinuity && !isReplay {
+                let nextGeneration = restartState.requestRestart(replaying: chunk)
                 await channel?.send(.discontinuity(chunk.capturePTS))
                 Task { [weak self] in
-                    do { try await self?.reset() }
-                    catch { /* reset has already emitted a scoped failure */ }
+                    do { try await self?.restart(generation: nextGeneration) }
+                    catch { /* restart has already emitted a scoped failure */ }
                 }
                 return nil
             }
@@ -661,21 +757,32 @@ private struct SystemAnalyzerInputs: AsyncSequence, Sendable {
     let backend: SystemSpeechBackend
     let generation: Int
     let input: AsyncStream<AudioSourceEvent>
+    let pendingChunk: AudioChunk?
 
     struct AsyncIterator: AsyncIteratorProtocol {
         let backend: SystemSpeechBackend
         let generation: Int
         var iterator: AsyncStream<AudioSourceEvent>.Iterator
+        var pendingChunk: AudioChunk?
 
         mutating func next() async -> AnalyzerInput? {
-            guard await backend.isCurrent(generation), !Task.isCancelled,
-                  let event = await iterator.next() else { return nil }
+            guard await backend.isCurrent(generation), !Task.isCancelled else { return nil }
+            if let pendingChunk {
+                self.pendingChunk = nil
+                return await backend.nextInput(.chunk(pendingChunk), generation: generation, isReplay: true)
+            }
+            guard let event = await iterator.next() else { return nil }
             return await backend.nextInput(event, generation: generation)
         }
     }
 
     func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(backend: backend, generation: generation, iterator: input.makeAsyncIterator())
+        AsyncIterator(
+            backend: backend,
+            generation: generation,
+            iterator: input.makeAsyncIterator(),
+            pendingChunk: pendingChunk
+        )
     }
 }
 

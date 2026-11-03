@@ -79,6 +79,43 @@ struct CapabilityServiceTests {
         #expect(didFinish)
     }
 
+    @MainActor
+    @Test
+    func testTranslationCompletionBeforeRecognitionFinishes() async {
+        let recognition = RecognitionAssetStub(statuses: [.missing, .ready], waitsForRelease: true)
+        let translation = TranslationAssetStub(statuses: [.missing, .ready])
+        let manager = LanguageAssetManager(recognition: recognition, translation: translation)
+        let stream = manager.prepare(source: testEnglish, target: testChinese)
+        while manager.translationConfiguration == nil { await Task.yield() }
+        while await recognition.prepareCallCount() == 0 { await Task.yield() }
+
+        manager.completeTranslationPreparation(token: manager.preparationToken)
+        await recognition.releasePreparation()
+        let finished = await withCapabilityTimeout {
+            for await event in stream {
+                if case .finished = event { return true }
+                if case .failed = event { return false }
+            }
+            return false
+        }
+        manager.cancelPreparation()
+        #expect(finished)
+    }
+
+    @MainActor
+    @Test
+    func testNewLanguageWaitsForPreviousReservationRelease() async {
+        let recognition = RecognitionAssetStub(statuses: [.missing, .ready, .missing, .ready])
+        let translation = TranslationAssetStub(status: .ready)
+        let manager = LanguageAssetManager(recognition: recognition, translation: translation)
+        for await _ in manager.prepare(source: testEnglish, target: testChinese) {}
+        let secondLanguage = LanguageIdentifier(rawValue: "zh-Hant")
+        for await _ in manager.prepare(source: secondLanguage, target: testChinese) {}
+
+        let events = await recognition.eventLog()
+        #expect(Array(events.suffix(3)) == ["prepare:en", "release", "prepare:zh-Hant"])
+    }
+
     private func expectAssetEvent(
         _ event: AssetEvent?,
         recognition: AssetState,
@@ -159,10 +196,19 @@ private actor TranslationCapabilityStub: TranslationCapabilityProviding {
 private actor RecognitionAssetStub: RecognitionAssetProviding {
     var statuses: [AssetState]
     let waitsForCancellation: Bool
+    let waitsForRelease: Bool
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var prepareCalls = 0
+    private var events: [String] = []
 
-    init(statuses: [AssetState], waitsForCancellation: Bool = false) {
+    init(
+        statuses: [AssetState],
+        waitsForCancellation: Bool = false,
+        waitsForRelease: Bool = false
+    ) {
         self.statuses = statuses
         self.waitsForCancellation = waitsForCancellation
+        self.waitsForRelease = waitsForRelease
     }
 
     func status(source: LanguageIdentifier) async -> AssetState {
@@ -171,22 +217,59 @@ private actor RecognitionAssetStub: RecognitionAssetProviding {
     }
 
     func prepare(source: LanguageIdentifier) async throws {
+        prepareCalls += 1
+        events.append("prepare:\(source.rawValue)")
         if waitsForCancellation {
             try await Task.sleep(for: .seconds(10))
         }
+        if waitsForRelease {
+            await withCheckedContinuation { continuation in
+                releaseContinuation = continuation
+            }
+        }
     }
 
-    func releaseReservations() async {}
+    func releasePreparation() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+
+    func prepareCallCount() -> Int { prepareCalls }
+    func eventLog() -> [String] { events }
+
+    func releaseReservations() async {
+        events.append("release")
+    }
 }
 
 private actor TranslationAssetStub: TranslationAssetProviding {
-    let statusValue: AssetState
+    var statuses: [AssetState]
 
     init(status: AssetState) {
-        self.statusValue = status
+        self.statuses = [status]
+    }
+
+    init(statuses: [AssetState]) {
+        self.statuses = statuses
     }
 
     func status(source: LanguageIdentifier, target: LanguageIdentifier) async -> AssetState {
-        statusValue
+        if statuses.count > 1 { return statuses.removeFirst() }
+        return statuses[0]
+    }
+}
+
+private func withCapabilityTimeout(
+    operation: @escaping @Sendable () async -> Bool
+) async -> Bool {
+    await withTaskGroup(of: Bool.self) { group in
+        group.addTask { await operation() }
+        group.addTask {
+            try? await Task.sleep(for: .seconds(1))
+            return false
+        }
+        let result = await group.next() ?? false
+        group.cancelAll()
+        return result
     }
 }
