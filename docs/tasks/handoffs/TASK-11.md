@@ -1,0 +1,66 @@
+# TASK-11 交接
+
+- 基线 commit：`cb1cd6580350b0d8960aa1963410e04461732864`（`origin/main`）。
+- 任务分支 / commit：`worktree-task-11-presentation`；实现、测试与本交接见本交接所属提交及后续审查修正提交。
+- 前置报告：`docs/reports/g0-device-report.md` 仍标记 G0 未完成；本任务按明确指派使用固定 Contracts 和任务内 doubles 独立实现，不据此宣称完整链路或真机能力通过。
+- 状态：待审查。
+
+## 改动
+
+- `LiveSubtitle/Presentation/SubtitleLayout.swift`：CoreText 按实际尺寸换行；译文突出、双语保留次要原文、仅译文不显示原文。空间不足优先保留最新段，不为塞入旧段无限缩字；覆盖中文长句、组合 emoji、显式换行和零尺寸。
+- `SubtitleRenderer.swift`：实现 `@MainActor SubtitleRenderer: SubtitleRendering`。显示段数、样式和 PiP 尺寸变化只重排当前快照；最多 10 fps，待绘工作只有最新快照，未变化内容约 1 秒心跳，视频 PTS 严格单调。clear 取消旧工作并串行 flush；渲染失败显式上报，心跳不强持有 renderer。
+- 生产帧使用自有 BGRA pixel buffer；Sendable 布局值在非隔离函数内完成像素绘制和 sample 创建，再将 `CMReadySampleBuffer` 交给 MainActor 的 iOS 27 Receiver `enqueueImmediately`。没有 `@unchecked Sendable`、媒体落盘或旧 enqueue 样板。
+- `PiPCoordinator.swift`：实现 `@MainActor PiPCoordinator: PiPControlling`。分别检查 supported／possible，处理异步启动失败、显式关闭、恢复界面、同会话重新启动和系统替换；旧 adapter 回调按对象及 generation 隔离，错误 sessionID 的 stop 不影响新会话。
+- AVKit 适配器实现完整 sample-buffer playback delegate，使用 `isPictureInPictureSuspended` 及 stopped 回调识别替换；render-size 回调只更新布局。失败、关闭和替换均停止 PiP 并清理字幕帧，由既有 Session 消费事件结束采集和翻译。
+- `LiveSubtitleTests/Presentation/`：五项任务卡具名验收及七项边界检查，共 12 项同源行为测试；fake clock 不做真实等待，系统 adapter 与帧输出 doubles 均在本任务测试目录。
+
+## 类型与装配
+
+- `SubtitleRenderer()`：MainActor 生产构造；`renderer.displayLayer` 是交给 PiP 的同一显示层。TASK-13 将 renderer 同时作为 `SubtitleRendering` 和 PiP 构造依赖。
+- `PiPCoordinator(renderer: SubtitleRenderer)`：MainActor 生产构造，内部连接 renderer 的失败回调和 displayLayer。
+- `SubtitleRenderer(output:clock:renderSize:)`、`PiPCoordinator(renderer:systemFactory:)` 为模块内部测试注入点，不要求 TASK-13 使用。
+- `updateRenderSize(_:)` 由系统适配器调用；`waitForClear()` 用于 PiP stop 等待串行清理。公共 Contracts 无变化。
+
+## 流、上限与取消
+
+- 渲染只有一个待绘 snapshot 和一个可取消调度任务；新快照覆盖旧待绘工作，不按中间版本排队视频帧。新内容在旧 flush 完成后才能入队，避免清帧串代。
+- PiP 事件内部队列最多 16 项，AsyncStream 显式使用 `.bufferingOldest(1)`；yield dropped 时保留原事件并重试。同类非终态回调合并，队列饱和时优先交付终态；terminal 事件在剩余事件排空后结束流，主动 stop 立即失效并结束。
+- renderer／PiP adapter／事件输出回调均避免强引用循环；旧 session 停止和晚到回调不能关闭新 output。
+- 字幕文字仅用于内存布局和像素帧；没有正文日志、网络、历史、导出或持久化。
+
+## 验证
+
+| 命令或设备步骤 | 环境 / 用例数 | 结果 | 未通过原因 |
+| --- | --- | --- | --- |
+| 修改前 `./scripts/verify.sh` | 基线 `cb1cd65` | 退出码 0 | 仅基线编译检查 |
+| TASK-11 RED→GREEN | Swift 6 完整并发、warnings-as-errors | 布局、renderer、PiP 分别因缺少实现失败；心跳所有权用例先失败后通过；iOS sample 隔离和 NSObject 初始化编译错误修正后通过 | 保留红绿证据 |
+| `TASK11_HOST_CHECK` 同源行为检查 | 12 项 | 全部通过；另连续 100 轮全部通过 | 不执行真实 AVKit／设备行为 |
+| 同一 host checks，`-sanitize=address` | 12 项 | 全部通过，退出码 0 | 不包含真实媒体对象 |
+| 同一 host checks，`-sanitize=thread` | 12 项 | 全部通过，退出码 0 | 不包含真实媒体对象 |
+| 既有 TASK-04／06／10 host checks | 21 + 28 + 16 项 | 全部通过 | 共享基线纯逻辑回归 |
+| 既有 G0 host checks | 13 项 | 全部通过 | 不替代 G0 真机链路 |
+| 最终 `./scripts/verify.sh` | Xcode / SDK 27.2 | 退出码 0；文档、plist、iOS Debug、Release、generic simulator App 与测试 bundle 编译通过 | 不执行行为测试 |
+| `./scripts/test.sh '<simulator-UDID>' -only-testing:LiveSubtitleTests` | `simctl list devices available` 为空 | 未执行 | 无可用 iOS 27 模拟器；不以测试 bundle 编译代替测试执行 |
+| 任务卡逐项验收 | 固定 snapshot、fake clock、系统 doubles | 五项具名验收均有主机行为证据，另有七项边界回归 | 真实设备 PiP 未验证 |
+
+主机复现命令：
+
+```sh
+swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
+  -module-cache-path build/task11/module-cache -D TASK11_HOST_CHECK \
+  LiveSubtitle/Contracts/Models/*.swift LiveSubtitle/Contracts/Ports/*.swift \
+  LiveSubtitle/Contracts/RuntimePolicy.swift LiveSubtitle/Presentation/*.swift \
+  LiveSubtitleTests/Presentation/*.swift -o build/task11/task11-host-checks
+./build/task11/task11-host-checks
+```
+
+## 契约请求
+
+- 无。未修改 Contracts、Config、App 装配、工程、scheme、脚本或其他任务实现。
+
+## 未验证与已知问题
+
+- G0 仍未完成；未验证真实 iPhone 上 PiP 启动、恢复、替换、拖动、缩放、Chrome 播放器冲突、后台持续显示或完整停止链路。`isPictureInPictureSuspended` 的真实系统时序必须由 TASK-14 核对。
+- 最终源码没有模拟器或真机测试 target 执行证据；主机检查使用同一布局、调度和协调器源码，真实 Receiver／AVKit 适配器仅有 SDK 编译证据。
+- TASK-13 需在 start 抛出或收到 failed／closed／replaced 时沿用 Session 停止协议；恢复界面后再次离开 App 时，可对同一 sessionID 调用 start，保留当前字幕并更换旧 PiP adapter。
+- 不把本任务的固定输入、编译和 sanitizer 结果写成 Chrome、双 PiP 或十五分钟后台能力通过。
