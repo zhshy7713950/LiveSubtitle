@@ -41,9 +41,8 @@
 | 既有 TASK-06／TASK-07 host checks | 28 + 8 项 | 全部通过 | 共享基线纯逻辑回归，不替代全量测试 |
 | 最终 `./scripts/verify.sh` | Xcode / SDK 27.2 | 退出码 0；文档、plist、iOS Debug、Release、generic simulator App 与测试 bundle 编译通过 | 不执行行为测试 |
 | `./scripts/test.sh '<simulator-UDID>' -only-testing:LiveSubtitleTests` | `simctl list devices available` 为空 | 未执行 | 无可用 iOS 模拟器运行时；不以测试 bundle 编译代替测试执行 |
-| 真机全量 `xcodebuild ... test -only-testing:LiveSubtitleTests` | 修复前测试版本 | 旧版 TASK-10 多项因 fake clock 并行忙等失败；已停止该次过期运行 | 不是最终源码结果，不据此判定最终用例失败 |
-| 最终源码真机重试 | 最终十六项版本 | 未执行 | 重试时设备已不在可用 destination 中，xcodebuild 退出码 70；没有最终真机行为证据 |
-| 任务卡逐项验收 | 固定 doubles / fake clock | 八项具名验收均有主机行为证据；另加八项对抗性回归 | 最终模拟器／真机全量行为测试未执行 |
+| 真机全量 `xcodebuild ... test -only-testing:LiveSubtitleTests` | 合并远程 main 后的最终源码，iOS 27.2 / Xcode 27.2 | 18 个 suite、145 项测试全部执行通过，无失败或跳过 | 固定响应与合成夹具；不代表真实 AI 服务或完整 G0 验收 |
+| 任务卡逐项验收 | 固定 doubles / fake clock 及真机全量测试 | 八项具名验收均有主机与真机行为证据；另加八项对抗性回归 | 模拟器全量行为测试未执行 |
 | 独立只读审查及修复回归 | 全任务新文件 | 时钟、旧流、stop、本地故障、候选淘汰和 deadline 溢出回归均 RED→GREEN；输出少量控制丢失指控由直接测试否定，另补控制饱和显式拒绝 | 未做第二轮独立复审；按修复回归和全套主机检查验证 |
 
 ## 契约请求
@@ -52,7 +51,6 @@
 
 ## 未验证与已知问题
 
-- G0 仍未完成；未连接真实 AI 服务，未验证真实本地模型、采集、识别、PiP 或设备生命周期。最终源码没有模拟器／真机全量测试证据。
+- G0 仍未完成；未连接真实 AI 服务，未验证真实本地模型、采集、识别、PiP 或设备生命周期。最终源码没有模拟器全量测试证据；合并远程 main 后的真机全量测试已通过。
 - `retainOnly` 对正在运行的淘汰 job 可能发出重复 dropped；不会启动新工作或触发回退，消费者仅将其作作用域校验后的清理事件。此非阻断项留待集成人评估。
 - TASK-13 装配时需保证协调器先写 store 保留集合再调用 submit，并在回退确认时传入增代 identity；配置变更和显式恢复 AI 继续由协调器统一处理。
-- 未推送、未合并 main。
