@@ -3,7 +3,7 @@
 - 基线 commit：`4302386fd263ed7a5564c3a186bd8ded856474ff`（`origin/main`）。
 - 任务分支 / commit：`worktree-task-09-storage`；实现与独立审查修正均在该分支，最终 commit 以分支 HEAD 为准。
 - 前置报告：`docs/reports/g0-device-report.md` 仍为 **G0 未通过**。本轮按用户明确的 TASK-09 指派完成隔离模块交付，不据此宣称完整链路可用。
-- 状态：**待审查**。实现、主机行为检查及工程编译已有证据；模拟器行为测试、iOS Keychain 属性断言和真实首次安装流程尚未执行。
+- 状态：**待审查**。实现、主机行为检查、工程编译及真机全量测试已有证据；模拟器行为测试和真实卸载／重装首次安装流程尚未执行。
 
 ## 改动
 
@@ -31,8 +31,10 @@
 | 独立审查回归 RED | `apiKey`、`access-token`、`signature`、fragment endpoint | 新增回归在旧实现上以 `expected invalidProfile` 失败 | 复用 `EndpointValidator` 后转绿，且已有有效 profile 不变 |
 | 最终 TASK09_HOST_CHECK：`swiftc -swift-version 6 -strict-concurrency=complete` 后运行本机检查 | macOS 主机，7 项同源行为检查 | 实际运行，7 项通过、0 失败 | 覆盖偏好字段、边界／坏数据、revision／删除、两个 profile 的 Key 替换／删除、missing key、首次清理及失败重试；macOS 不执行 iOS 访问级别属性断言 |
 | 最终 `./scripts/verify.sh` | Xcode／iOS SDK 27.2 | 退出码 0；device-debug、device-release、simulator-tests 均 build succeeded | 仅编译，不等于模拟器测试执行 |
-| `xcrun simctl list devices available` | 本机最终检查 | 无可用设备，未得到 UDID | 因此未执行 `./scripts/test.sh '<UDID>' -only-testing:LiveSubtitleTests`，不声称全量 Swift Testing 通过 |
-| 任务卡四项指定验收 | 同源 Swift Testing 与主机辅助函数 | 四项测试均已建立；对应主机行为已执行通过 | iOS-only `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` 查询断言仅完成编译，未实际运行 |
+| `xcrun simctl list devices available` | 本机最终检查 | 无可用模拟器，未得到模拟器 UDID | `./scripts/test.sh '<UDID>' -only-testing:LiveSubtitleTests` 未执行；真机测试另行记录 |
+| 真机 `xcodebuild ... -only-testing:LiveSubtitleTests test` 首轮 | iPhone 17 Pro／iOS 27.2；16 suites／129 tests | 129 项执行，2 项 Cloud 取消时序测试失败；TASK-09 六项全部通过 | 失败为 `testCancellationDropsLateResults`、`testConnectionProbeCancellation`；不隐去首轮结果 |
+| 真机同命令复跑 | 同一真机；16 suites／129 tests | 退出码 0，129 项通过、0 失败；TASK-09 六项再次全部通过 | 首轮 Cloud 失败未复现；不包含真实媒体链路验收 |
+| 任务卡四项指定验收 | 同源 Swift Testing 与主机辅助函数 | 四项测试及两项额外测试均已在真机执行通过 | `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` iOS 查询断言已实际通过；锁屏场景未测 |
 
 主机检查复现命令：
 
@@ -56,9 +58,9 @@ swiftc -swift-version 6 -strict-concurrency=complete \
 
 ## 未验证与已知问题
 
-- 没有可用模拟器，完整 `LiveSubtitleTests` 及本任务 Swift Testing wrapper 未在 iOS runtime 执行；测试 bundle 编译通过不能替代行为测试。
-- macOS 普通 Keychain 不返回 `kSecAttrAccessible`；Data Protection Keychain 主机探针因缺少 entitlement 返回 -34018，因此访问级别属性断言仅保留在 iOS 路径，需后续在模拟器或真机执行。锁屏拒绝读取也未做设备验证。
+- 没有可用模拟器，`scripts/test.sh` 未执行；完整 `LiveSubtitleTests` 已在真机复跑通过，不能据此声称模拟器行为一致。
+- macOS 普通 Keychain 不返回 `kSecAttrAccessible`；Data Protection Keychain 主机探针因缺少 entitlement 返回 -34018。iOS 访问级别属性断言已在真机通过；主动锁屏并读取的场景未单独验证。
 - 未执行真实卸载／重装后的首次启动清理，只验证了隔离命名空间、容器标志和失败重试逻辑。
 - 额外测试增强暂未覆盖 N=1、10 的独立往返及 `RuntimePolicy.defaultDisplayCount` 的直接断言；本轮已执行默认夹具 3、0／11 拒绝和无效写入不覆盖有效数据。
 - G0 仍未通过；本交付不证明采集、识别、翻译、PiP、后台或完整产品链路可用。
-- 未推送、未合并；等待集成人审查及全量验证。
+- 远端推送、PR 和合并由用户明确授权；最终集成状态以远端 PR 为准。报告及原始公开交接不记录设备标识、签名材料或 fixture Key。
