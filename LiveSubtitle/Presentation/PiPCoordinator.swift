@@ -165,7 +165,7 @@ final class PiPCoordinator: PiPControlling {
 
         let system = systemFactory(renderer)
         guard system.isSupported, system.isPossible else {
-            renderer.clear()
+            renderer.deactivate(sessionID: sessionID)
             throw FailureCode.pipFailed
         }
 
@@ -178,6 +178,7 @@ final class PiPCoordinator: PiPControlling {
         self.sessionID = sessionID
         restoring = false
         terminal = false
+        renderer.activate(sessionID: sessionID)
         system.eventHandler = { [weak self, weak system] event in
             guard let system else { return }
             self?.receive(event, from: system, generation: generation)
@@ -194,6 +195,7 @@ final class PiPCoordinator: PiPControlling {
     }
 
     private func invalidateCurrent(clearRenderer: Bool) {
+        let previousSessionID = sessionID
         system?.eventHandler = nil
         system?.stop()
         system = nil
@@ -202,7 +204,13 @@ final class PiPCoordinator: PiPControlling {
         sessionID = nil
         restoring = false
         terminal = true
-        if clearRenderer { renderer.clear() }
+        if clearRenderer {
+            if let previousSessionID {
+                renderer.deactivate(sessionID: previousSessionID)
+            } else {
+                renderer.clear()
+            }
+        }
     }
 
     private func receive(
@@ -255,7 +263,11 @@ final class PiPCoordinator: PiPControlling {
         restoring = false
         system?.eventHandler = nil
         system?.stop()
-        renderer.clear()
+        if let sessionID {
+            renderer.deactivate(sessionID: sessionID)
+        } else {
+            renderer.clear()
+        }
         if let event {
             _ = output?.emit(event)
         } else {

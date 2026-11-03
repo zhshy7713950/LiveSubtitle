@@ -73,7 +73,10 @@ private func checkCloseRestoreAndReplacementDiffer() async throws {
 
     let firstID = UUID()
     let firstStream = try await coordinator.start(sessionID: firstID)
-    renderer.present(task11Snapshot(segments: [task11Segment(source: "source", translation: "译文")]))
+    renderer.present(task11Snapshot(
+        segments: [task11Segment(source: "source", translation: "译文")],
+        identity: task11Identity(sessionID: firstID)
+    ))
     clock.advance(toMilliseconds: 100)
     await task11WaitUntil { output.visibleFrame != nil }
     systems[0].emit(.started)
@@ -147,7 +150,11 @@ private func checkUnsupportedOrImpossiblePiPFails() async throws {
     let coordinator = task11Coordinator(renderer: renderer, systems: systems)
 
     for (index, sessionID) in [UUID(), UUID()].enumerated() {
-        renderer.present(task11Snapshot(segments: [task11Segment(source: "source", translation: "译文")]))
+        renderer.activate(sessionID: sessionID)
+        renderer.present(task11Snapshot(
+            segments: [task11Segment(source: "source", translation: "译文")],
+            identity: task11Identity(sessionID: sessionID)
+        ))
         do {
             _ = try await coordinator.start(sessionID: sessionID)
             throw Task11CheckFailure(message: "unsupported or impossible PiP started successfully")
@@ -162,8 +169,12 @@ private func checkUnsupportedOrImpossiblePiPFails() async throws {
     try task11Require(systems[1].possibleReadCount == 1, "possible was not checked on a supported device")
 
     let sessionID = UUID()
-    renderer.present(task11Snapshot(segments: [task11Segment(source: "source", translation: "译文")]))
     let stream = try await coordinator.start(sessionID: sessionID)
+    renderer.present(task11Snapshot(
+        segments: [task11Segment(source: "source", translation: "译文")],
+        identity: task11Identity(sessionID: sessionID)
+    ))
+    await task11WaitUntil { output.visibleFrame != nil }
     systems[2].emit(.failed)
     if case .failed(let id, let reason) = try await task11NextPiPEvent(stream) {
         try task11Require(id == sessionID && reason == .pipFailed, "async start failure lost its scope or reason")

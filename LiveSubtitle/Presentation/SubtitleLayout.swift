@@ -8,6 +8,45 @@ enum SubtitleLineRole: Sendable {
     case status
 }
 
+struct SubtitleLayoutInput: Equatable, Sendable {
+    struct Segment: Equatable, Sendable {
+        let segmentID: UUID
+        let sourceText: String
+        let translationText: String?
+    }
+
+    let segments: [Segment]
+    let displayCount: Int
+    let translationOnly: Bool
+    let statusText: String?
+
+    init(snapshot: SubtitleSnapshot) {
+        segments = snapshot.segments.map { segment in
+            let translation: String?
+            switch segment.translationState {
+            case .translated(let text, _, _): translation = text
+            case .updating(let previousText, _): translation = previousText
+            case .pending, .failed: translation = nil
+            }
+            return Segment(
+                segmentID: segment.segmentID,
+                sourceText: segment.sourceText,
+                translationText: translation
+            )
+        }
+        displayCount = snapshot.displayCount
+        translationOnly = snapshot.displayStyle == .translationOnly
+        switch snapshot.status {
+        case .waitingForAudio: statusText = "等待声音"
+        case .listening: statusText = nil
+        case .processingSlowly: statusText = "处理较慢"
+        case .localFallback: statusText = "AI 不可用，已切换本地"
+        case .stopping: statusText = "正在停止"
+        case .failed: statusText = "字幕已停止"
+        }
+    }
+}
+
 struct SubtitleLayout: Sendable {
     struct Line: Sendable {
         let text: String
@@ -38,6 +77,10 @@ struct SubtitleLayout: Sendable {
     let lines: [Line]
 
     init(snapshot: SubtitleSnapshot, size: CGSize) {
+        self.init(input: SubtitleLayoutInput(snapshot: snapshot), size: size)
+    }
+
+    init(input: SubtitleLayoutInput, size: CGSize) {
         self.size = size
         guard size.width > 0, size.height > 0 else {
             lines = []
@@ -54,16 +97,16 @@ struct SubtitleLayout: Sendable {
         let translationSize = max(18, min(34, size.height * 0.075))
         let sourceSize = max(12, translationSize * 0.7)
         let statusSize = max(12, min(18, size.height * 0.045))
-        let statusGroup = Self.statusGroup(snapshot: snapshot, width: contentWidth, fontSize: statusSize)
+        let statusGroup = Self.statusGroup(text: input.statusText, width: contentWidth, fontSize: statusSize)
         let availableHeight = max(0, size.height - inset * 2 - (statusGroup?.height ?? 0))
 
-        let displayCount = min(max(snapshot.displayCount, 1), RuntimePolicy.retainedSegmentLimit)
+        let displayCount = min(max(input.displayCount, 1), RuntimePolicy.retainedSegmentLimit)
         var selected: [DraftGroup] = []
         var usedHeight: CGFloat = 0
-        for segment in snapshot.segments.suffix(displayCount).reversed() {
+        for segment in input.segments.suffix(displayCount).reversed() {
             let group = Self.segmentGroup(
                 segment,
-                style: snapshot.displayStyle,
+                translationOnly: input.translationOnly,
                 width: contentWidth,
                 translationSize: translationSize,
                 sourceSize: sourceSize
@@ -133,13 +176,13 @@ struct SubtitleLayout: Sendable {
     }
 
     private static func segmentGroup(
-        _ segment: CaptionSegment,
-        style: DisplayStyle,
+        _ segment: SubtitleLayoutInput.Segment,
+        translationOnly: Bool,
         width: CGFloat,
         translationSize: CGFloat,
         sourceSize: CGFloat
     ) -> DraftGroup {
-        let translation = translationText(segment.translationState)
+        let translation = segment.translationText
         var drafts: [DraftLine] = []
         if let translation, !translation.isEmpty {
             drafts.append(contentsOf: wrap(
@@ -150,7 +193,7 @@ struct SubtitleLayout: Sendable {
                 color: CGColor(gray: 1, alpha: 1),
                 width: width
             ))
-            if style == .bilingual, !segment.sourceText.isEmpty {
+            if !translationOnly, !segment.sourceText.isEmpty {
                 drafts.append(contentsOf: wrap(
                     text: segment.sourceText,
                     role: .source,
@@ -160,7 +203,7 @@ struct SubtitleLayout: Sendable {
                     width: width
                 ))
             }
-        } else if style == .bilingual, !segment.sourceText.isEmpty {
+        } else if !translationOnly, !segment.sourceText.isEmpty {
             drafts.append(contentsOf: wrap(
                 text: segment.sourceText,
                 role: .source,
@@ -173,16 +216,7 @@ struct SubtitleLayout: Sendable {
         return DraftGroup(lines: drafts)
     }
 
-    private static func statusGroup(snapshot: SubtitleSnapshot, width: CGFloat, fontSize: CGFloat) -> DraftGroup? {
-        let text: String?
-        switch snapshot.status {
-        case .waitingForAudio: text = "等待声音"
-        case .listening: text = nil
-        case .processingSlowly: text = "处理较慢"
-        case .localFallback: text = "AI 不可用，已切换本地"
-        case .stopping: text = "正在停止"
-        case .failed: text = "字幕已停止"
-        }
+    private static func statusGroup(text: String?, width: CGFloat, fontSize: CGFloat) -> DraftGroup? {
         guard let text else { return nil }
         return DraftGroup(lines: wrap(
             text: text,
@@ -192,14 +226,6 @@ struct SubtitleLayout: Sendable {
             color: CGColor(gray: 0.82, alpha: 1),
             width: width
         ))
-    }
-
-    private static func translationText(_ state: CaptionTranslationState) -> String? {
-        switch state {
-        case .translated(let text, _, _): text
-        case .updating(let previousText, _): previousText
-        case .pending, .failed: nil
-        }
     }
 
     private static func wrap(

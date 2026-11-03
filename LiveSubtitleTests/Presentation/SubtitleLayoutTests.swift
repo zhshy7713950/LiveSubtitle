@@ -15,6 +15,8 @@ func task11Require(_ condition: @autoclosure () -> Bool, _ message: String) thro
     if !condition() { throw Task11CheckFailure(message: message) }
 }
 
+private func task11IsMainThread() -> Bool { Thread.isMainThread }
+
 func task11Identity(sessionID: UUID = UUID()) -> SessionIdentity {
     SessionIdentity(sessionID: sessionID, languageEpoch: 1, engineEpoch: 2, cloudConfigRevision: 3)
 }
@@ -60,6 +62,12 @@ func task11Snapshot(
         effectiveMode: .local,
         status: status
     )
+}
+
+@MainActor
+func task11Present(_ renderer: SubtitleRenderer, _ snapshot: SubtitleSnapshot) {
+    renderer.activate(sessionID: snapshot.identity.sessionID)
+    renderer.present(snapshot)
 }
 
 private func checkNewestReadableLinesWin() throws {
@@ -216,10 +224,7 @@ func task11Yield() async {
 
 @MainActor
 func task11WaitUntil(_ predicate: @MainActor () -> Bool) async {
-    for _ in 0..<100 {
-        if predicate() { return }
-        await Task.yield()
-    }
+    while !predicate() { await Task.yield() }
 }
 
 @MainActor
@@ -230,15 +235,17 @@ private func checkDisplayChangesDoNotRestartPipeline() async throws {
     let old = task11Segment(source: "Old source", translation: "旧译文", start: 0)
     let newest = task11Segment(source: "New source", translation: "新译文", start: 1_000)
     let identity = task11Identity()
-    renderer.present(task11Snapshot(segments: [old, newest], identity: identity))
+    task11Present(renderer,task11Snapshot(segments: [old, newest], identity: identity))
+    await task11WaitUntil { output.frames.count == 1 }
     try task11Require(output.frames.count == 1, "the first subtitle frame was not generated")
+    let initialFlushes = output.flushCount
 
-    renderer.present(task11Snapshot(segments: [old, newest], displayCount: 1, style: .translationOnly, identity: identity))
+    task11Present(renderer,task11Snapshot(segments: [old, newest], displayCount: 1, style: .translationOnly, identity: identity))
     renderer.updateRenderSize(CGSize(width: 320, height: 180))
     clock.advance(toMilliseconds: 100)
     await task11WaitUntil { output.frames.count == 2 }
 
-    try task11Require(output.flushCount == 0, "a display-only change flushed or restarted the renderer")
+    try task11Require(output.flushCount == initialFlushes, "a display-only change flushed or restarted the renderer")
     try task11Require(output.frames.count == 2, "a display-only change did not redraw the existing snapshot")
     let visible = try task11Value(output.visibleFrame)
     try task11Require(visible.layout.lines.allSatisfy { $0.role != .source }, "style change required a new source layout")
@@ -252,11 +259,12 @@ private func checkFrameCoalescingAndPTS() async throws {
     let output = Task11FrameOutput()
     let renderer = SubtitleRenderer(output: output, clock: clock)
     let first = task11Snapshot(segments: [task11Segment(source: "one", translation: "第一版")])
-    renderer.present(first)
+    task11Present(renderer,first)
+    await task11WaitUntil { output.frames.count == 1 }
     let firstPTS = try task11Value(output.frames.first).presentationTimeStamp
 
     for index in 2...20 {
-        renderer.present(task11Snapshot(
+        task11Present(renderer,task11Snapshot(
             segments: [task11Segment(source: "source \(index)", translation: "版本 \(index)")],
             identity: first.identity
         ))
@@ -272,7 +280,7 @@ private func checkFrameCoalescingAndPTS() async throws {
     try task11Require(CMTimeCompare(latest.presentationTimeStamp, firstPTS) > 0, "video PTS did not increase monotonically")
 
     for index in 21...40 {
-        renderer.present(task11Snapshot(
+        task11Present(renderer,task11Snapshot(
             segments: [task11Segment(source: "source \(index)", translation: "版本 \(index)")],
             identity: first.identity
         ))
@@ -288,7 +296,8 @@ private func checkUnchangedFramesUseBoundedHeartbeat() async throws {
     let clock = Task11Clock()
     let output = Task11FrameOutput()
     let renderer = SubtitleRenderer(output: output, clock: clock)
-    renderer.present(task11Snapshot(segments: [task11Segment(source: "source", translation: "译文")]))
+    task11Present(renderer,task11Snapshot(segments: [task11Segment(source: "source", translation: "译文")]))
+    await task11WaitUntil { output.frames.count == 1 }
     clock.advance(toMilliseconds: 999)
     await task11Yield()
     try task11Require(output.frames.count == 1, "unchanged text rendered at the maximum frame rate")
@@ -309,16 +318,18 @@ private func checkClearRemovesFramesAndCancelsOldWork() async throws {
     let output = Task11FrameOutput()
     let renderer = SubtitleRenderer(output: output, clock: clock)
     let identity = task11Identity()
-    renderer.present(task11Snapshot(segments: [task11Segment(source: "old", translation: "旧文字")], identity: identity))
-    renderer.present(task11Snapshot(segments: [task11Segment(source: "pending", translation: "待绘旧文字")], identity: identity))
+    task11Present(renderer,task11Snapshot(segments: [task11Segment(source: "old", translation: "旧文字")], identity: identity))
+    await task11WaitUntil { output.frames.count == 1 }
+    task11Present(renderer,task11Snapshot(segments: [task11Segment(source: "pending", translation: "待绘旧文字")], identity: identity))
+    let flushesBeforeClear = output.flushCount
     renderer.clear()
     await renderer.waitForClear()
-    try task11Require(output.visibleFrame == nil && output.flushCount == 1, "clear did not remove the displayed frame")
+    try task11Require(output.visibleFrame == nil && output.flushCount == flushesBeforeClear + 1, "clear did not remove the displayed frame")
     clock.advance(toMilliseconds: 2_000)
     await task11Yield()
     try task11Require(output.frames.count == 1, "clear left a pending frame or heartbeat alive")
 
-    renderer.present(task11Snapshot(segments: [task11Segment(source: "new", translation: "新文字")]))
+    task11Present(renderer,task11Snapshot(segments: [task11Segment(source: "new", translation: "新文字")]))
     await task11WaitUntil { output.visibleFrame != nil }
     try task11Require(output.visibleFrame?.layout.lines.filter { $0.role == .translation }.map(\.text).joined() == "新文字", "new content could not render after clear")
 }
@@ -331,7 +342,8 @@ private func checkRenderFailureStopsRetries() async throws {
     var failures: [FailureCode] = []
     renderer.onFailure = { failures.append($0) }
     output.failNextEnqueue = true
-    renderer.present(task11Snapshot(segments: [task11Segment(source: "source", translation: "译文")]))
+    task11Present(renderer,task11Snapshot(segments: [task11Segment(source: "source", translation: "译文")]))
+    await task11WaitUntil { failures.count == 1 }
     try task11Require(failures == [.pipFailed], "frame enqueue failure was not surfaced")
     clock.advance(toMilliseconds: 5_000)
     await task11Yield()
@@ -344,19 +356,170 @@ private func checkRendererReleasesWhenOwnerDrops() async throws {
     let output = Task11FrameOutput()
     var renderer: SubtitleRenderer? = SubtitleRenderer(output: output, clock: clock)
     weak let weakRenderer = renderer
-    renderer?.present(task11Snapshot(segments: [task11Segment(source: "source", translation: "译文")]))
+    let snapshot = task11Snapshot(segments: [task11Segment(source: "source", translation: "译文")])
+    renderer?.activate(sessionID: snapshot.identity.sessionID)
+    renderer?.present(snapshot)
     renderer = nil
     await task11Yield()
     try task11Require(weakRenderer == nil, "heartbeat task retained the renderer after its owner released it")
 }
 
+private func checkTimebaseStartsOnceUntilFlush() throws {
+    var state = SubtitleTimebaseState()
+    try task11Require(state.nextEnqueueAction() == .start, "the first frame did not establish a timebase")
+    try task11Require(state.nextEnqueueAction() == .none, "a subsequent frame reset the timebase")
+    try task11Require(state.nextEnqueueAction() == .none, "repeated frames kept resetting the timebase")
+    state.didFlush()
+    try task11Require(state.nextEnqueueAction() == .start, "flush did not re-establish the timebase")
+    try task11Require(state.nextEnqueueAction() == .none, "timebase recovery became a per-frame reset")
+}
+
+@MainActor
+private func checkDuplicateSnapshotsUseHeartbeat() async throws {
+    let clock = Task11Clock()
+    let output = Task11FrameOutput()
+    let renderer = SubtitleRenderer(output: output, clock: clock)
+    let identity = task11Identity()
+    let snapshot = task11Snapshot(
+        segments: [task11Segment(source: "same source", translation: "相同译文")],
+        identity: identity
+    )
+    renderer.activate(sessionID: identity.sessionID)
+    task11Present(renderer,snapshot)
+    await task11WaitUntil { output.frames.count == 1 }
+    for _ in 0..<20 { task11Present(renderer,snapshot) }
+    clock.advance(toMilliseconds: 1_000)
+    await task11WaitUntil { output.frames.count == 2 }
+    clock.advance(toMilliseconds: 2_000)
+    await task11WaitUntil { output.frames.count == 3 }
+    try task11Require(output.frames.count == 3, "identical snapshots rendered at 10 fps instead of the heartbeat")
+}
+
+@MainActor
+private func checkStaleSnapshotsCannotReplaceActiveSession() async throws {
+    let clock = Task11Clock()
+    let output = Task11FrameOutput()
+    let renderer = SubtitleRenderer(output: output, clock: clock)
+    let oldIdentity = task11Identity()
+    let newIdentity = task11Identity()
+    renderer.activate(sessionID: oldIdentity.sessionID)
+    task11Present(renderer,task11Snapshot(
+        segments: [task11Segment(source: "old", translation: "旧会话")],
+        identity: oldIdentity
+    ))
+    await task11WaitUntil { output.frames.count == 1 }
+    renderer.deactivate(sessionID: oldIdentity.sessionID)
+    renderer.present(task11Snapshot(
+        segments: [task11Segment(source: "late old", translation: "停止后的旧文字")],
+        identity: oldIdentity
+    ))
+    clock.advance(toMilliseconds: 100)
+    await task11Yield()
+    try task11Require(output.frames.count == 1, "a stopped session restarted subtitle rendering")
+
+    renderer.activate(sessionID: newIdentity.sessionID)
+    task11Present(renderer,task11Snapshot(
+        segments: [task11Segment(source: "new", translation: "新会话")],
+        identity: newIdentity
+    ))
+    clock.advance(toMilliseconds: 200)
+    await task11WaitUntil { output.frames.count == 2 }
+    let flushes = output.flushCount
+    renderer.present(task11Snapshot(
+        segments: [task11Segment(source: "late old", translation: "迟到旧文字")],
+        identity: oldIdentity
+    ))
+    clock.advance(toMilliseconds: 300)
+    await task11Yield()
+    try task11Require(output.frames.count == 2 && output.flushCount == flushes,
+                      "an old session flushed or replaced the new session")
+    try task11Require(output.visibleFrame?.layout.lines.filter { $0.role == .translation }.map(\.text).joined() == "新会话",
+                      "an old session replaced the visible translation")
+}
+
+actor Task11FrameBuilder: SubtitleFrameBuilding {
+    private(set) var calls = 0
+    private(set) var maximumActive = 0
+    private(set) var wasMainThread = false
+    private var active = 0
+    private var suspendNext = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func suspendNextBuild() { suspendNext = true }
+
+    func releaseBuild() {
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func make(
+        input: SubtitleLayoutInput,
+        size: CGSize,
+        presentationTimeStamp: CMTime
+    ) async throws -> SubtitleFrame {
+        calls += 1
+        active += 1
+        maximumActive = max(maximumActive, active)
+        wasMainThread = task11IsMainThread()
+        defer { active -= 1 }
+        if suspendNext {
+            suspendNext = false
+            await withCheckedContinuation { continuation = $0 }
+        }
+        return try SubtitleFrame(
+            layout: SubtitleLayout(input: input, size: size),
+            presentationTimeStamp: presentationTimeStamp
+        )
+    }
+}
+
+@MainActor
+private func checkFrameBuildingUsesSingleSerializedWorker() async throws {
+    let clock = Task11Clock()
+    let output = Task11FrameOutput()
+    let builder = Task11FrameBuilder()
+    let renderer = SubtitleRenderer(output: output, clock: clock, builder: builder)
+    let identity = task11Identity()
+    renderer.activate(sessionID: identity.sessionID)
+    await builder.suspendNextBuild()
+    task11Present(renderer,task11Snapshot(
+        segments: [task11Segment(source: "first", translation: "第一版")],
+        identity: identity
+    ))
+    for _ in 0..<100 {
+        if await builder.calls == 1 { break }
+        await Task.yield()
+    }
+    for index in 2...20 {
+        task11Present(renderer,task11Snapshot(
+            segments: [task11Segment(source: "source \(index)", translation: "版本 \(index)")],
+            identity: identity
+        ))
+    }
+    let callsDuringBurst = await builder.calls
+    try task11Require(callsDuringBurst == 1, "snapshot bursts started unbounded frame builders")
+    await builder.releaseBuild()
+    clock.advance(toMilliseconds: 100)
+    await task11WaitUntil { output.visibleFrame?.layout.lines.filter { $0.role == .translation }.map(\.text).joined() == "版本 20" }
+    let maximumActive = await builder.maximumActive
+    let calls = await builder.calls
+    let wasMainThread = await builder.wasMainThread
+    try task11Require(maximumActive == 1, "frame builders ran concurrently")
+    try task11Require(calls <= 2, "stale frame work was not coalesced")
+    try task11Require(!wasMainThread, "frame building remained on the main thread")
+}
+
 func runSubtitleRendererChecks() async throws {
+    try checkTimebaseStartsOnceUntilFlush()
     try await checkDisplayChangesDoNotRestartPipeline()
     try await checkFrameCoalescingAndPTS()
     try await checkUnchangedFramesUseBoundedHeartbeat()
     try await checkClearRemovesFramesAndCancelsOldWork()
     try await checkRenderFailureStopsRetries()
     try await checkRendererReleasesWhenOwnerDrops()
+    try await checkDuplicateSnapshotsUseHeartbeat()
+    try await checkStaleSnapshotsCannotReplaceActiveSession()
+    try await checkFrameBuildingUsesSingleSerializedWorker()
 }
 
 func task11Value<T>(_ value: T?) throws -> T {
@@ -371,7 +534,7 @@ private struct Task11HostChecks {
         try runSubtitleLayoutChecks()
         try await runSubtitleRendererChecks()
         try await runPiPCoordinatorChecks()
-        print("12 TASK-11 host checks passed; no SDK/device behavior tested.")
+        print("16 TASK-11 host checks passed; no SDK/device behavior tested.")
     }
 }
 #else
@@ -391,6 +554,16 @@ struct SubtitleLayoutTests {
     @Test @MainActor func testRenderFailureStopsRetries() async throws { try await checkRenderFailureStopsRetries() }
     @Test @MainActor func testRendererReleasesWhenOwnerDrops() async throws {
         try await checkRendererReleasesWhenOwnerDrops()
+    }
+    @Test func testTimebaseStartsOnceUntilFlush() throws { try checkTimebaseStartsOnceUntilFlush() }
+    @Test @MainActor func testDuplicateSnapshotsUseHeartbeat() async throws {
+        try await checkDuplicateSnapshotsUseHeartbeat()
+    }
+    @Test @MainActor func testStaleSnapshotsCannotReplaceActiveSession() async throws {
+        try await checkStaleSnapshotsCannotReplaceActiveSession()
+    }
+    @Test @MainActor func testFrameBuildingUsesSingleSerializedWorker() async throws {
+        try await checkFrameBuildingUsesSingleSerializedWorker()
     }
 }
 #endif

@@ -21,8 +21,26 @@ struct PresentationSystemClock: MonotonicClock {
     }
 }
 
-@MainActor
-struct SubtitleFrame {
+enum SubtitleTimebaseAction {
+    case start
+    case none
+}
+
+struct SubtitleTimebaseState {
+    private var needsStart = true
+
+    mutating func nextEnqueueAction() -> SubtitleTimebaseAction {
+        guard needsStart else { return .none }
+        needsStart = false
+        return .start
+    }
+
+    mutating func didFlush() {
+        needsStart = true
+    }
+}
+
+struct SubtitleFrame: Sendable {
     let layout: SubtitleLayout
     let presentationTimeStamp: CMTime
     #if !TASK11_HOST_CHECK
@@ -105,6 +123,27 @@ struct SubtitleFrame {
     #endif
 }
 
+protocol SubtitleFrameBuilding: Sendable {
+    func make(
+        input: SubtitleLayoutInput,
+        size: CGSize,
+        presentationTimeStamp: CMTime
+    ) async throws -> SubtitleFrame
+}
+
+actor SubtitleFrameBuilder: SubtitleFrameBuilding {
+    func make(
+        input: SubtitleLayoutInput,
+        size: CGSize,
+        presentationTimeStamp: CMTime
+    ) async throws -> SubtitleFrame {
+        try SubtitleFrame(
+            layout: SubtitleLayout(input: input, size: size),
+            presentationTimeStamp: presentationTimeStamp
+        )
+    }
+}
+
 @MainActor
 protocol SubtitleFrameOutput: AnyObject {
     func enqueue(_ frame: SubtitleFrame) throws
@@ -116,6 +155,7 @@ protocol SubtitleFrameOutput: AnyObject {
 final class ReceiverSubtitleFrameOutput: SubtitleFrameOutput {
     private let synchronizer: AVSampleBufferRenderSynchronizer
     private let receiver: AVSampleBufferVideoRenderer.Receiver
+    private var timebase = SubtitleTimebaseState()
 
     init(layer: AVSampleBufferDisplayLayer) {
         synchronizer = AVSampleBufferRenderSynchronizer()
@@ -124,7 +164,9 @@ final class ReceiverSubtitleFrameOutput: SubtitleFrameOutput {
     }
 
     func enqueue(_ frame: SubtitleFrame) throws {
-        synchronizer.setRate(1, time: .zero)
+        if timebase.nextEnqueueAction() == .start {
+            synchronizer.setRate(1, time: .zero)
+        }
         switch receiver.enqueueImmediately(frame.sample) {
         case .enqueued:
             return
@@ -136,25 +178,36 @@ final class ReceiverSubtitleFrameOutput: SubtitleFrameOutput {
     func flush() async {
         await receiver.flush(removingDisplayedImage: true)
         synchronizer.setRate(0, time: .zero)
+        timebase.didFlush()
     }
 }
 #endif
 
 @MainActor
 final class SubtitleRenderer: SubtitleRendering {
+    private struct RenderJob {
+        let sessionID: UUID
+        let input: SubtitleLayoutInput
+        let size: CGSize
+        let presentationTimeStamp: CMTime
+    }
+
     #if !TASK11_HOST_CHECK
     let displayLayer: AVSampleBufferDisplayLayer
     #endif
 
     private let output: any SubtitleFrameOutput
     private let clock: any MonotonicClock
+    private let builder: any SubtitleFrameBuilding
     private var renderSize: CGSize
-    private var currentSnapshot: SubtitleSnapshot?
-    private var pendingSnapshot: SubtitleSnapshot?
-    private var currentLayout: SubtitleLayout?
+    private var activeSessionID: UUID?
+    private var acceptedInput: SubtitleLayoutInput?
+    private var pendingInput: SubtitleLayoutInput?
+    private var renderedInput: SubtitleLayoutInput?
     private var renderTask: Task<Void, Never>?
     private var clearTask: Task<Void, Never>?
     private var workID: UInt64 = 0
+    private var isComputing = false
     private var lastRenderUptime: UInt64?
     private var ptsOrigin: UInt64?
     private var lastPTSTick: Int64?
@@ -168,17 +221,17 @@ final class SubtitleRenderer: SubtitleRendering {
         layer.backgroundColor = CGColor(gray: 0, alpha: 1)
         self.init(output: ReceiverSubtitleFrameOutput(layer: layer), clock: PresentationSystemClock(), displayLayer: layer)
     }
-    #endif
 
-    #if !TASK11_HOST_CHECK
     init(
         output: any SubtitleFrameOutput,
         clock: any MonotonicClock,
+        builder: any SubtitleFrameBuilding = SubtitleFrameBuilder(),
         displayLayer: AVSampleBufferDisplayLayer = AVSampleBufferDisplayLayer(),
         renderSize: CGSize = CGSize(width: 960, height: 540)
     ) {
         self.output = output
         self.clock = clock
+        self.builder = builder
         self.renderSize = renderSize
         self.displayLayer = displayLayer
     }
@@ -186,42 +239,54 @@ final class SubtitleRenderer: SubtitleRendering {
     init(
         output: any SubtitleFrameOutput,
         clock: any MonotonicClock,
+        builder: any SubtitleFrameBuilding = SubtitleFrameBuilder(),
         renderSize: CGSize = CGSize(width: 960, height: 540)
     ) {
         self.output = output
         self.clock = clock
+        self.builder = builder
         self.renderSize = renderSize
     }
     #endif
 
+    func activate(sessionID: UUID) {
+        guard activeSessionID != sessionID else { return }
+        activeSessionID = sessionID
+        clear()
+    }
+
+    func deactivate(sessionID: UUID) {
+        guard activeSessionID == sessionID else { return }
+        activeSessionID = nil
+        clear()
+    }
+
     func present(_ snapshot: SubtitleSnapshot) {
-        if let currentSnapshot, currentSnapshot.identity.sessionID != snapshot.identity.sessionID {
-            clear()
-        }
-        currentSnapshot = snapshot
-        pendingSnapshot = snapshot
-        if lastRenderUptime == nil, clearTask == nil {
-            if drawPending() { scheduleHeartbeat() }
-        } else {
-            schedulePending()
-        }
+        guard activeSessionID == snapshot.identity.sessionID else { return }
+        let input = SubtitleLayoutInput(snapshot: snapshot)
+        guard input != acceptedInput else { return }
+        acceptedInput = input
+        pendingInput = input
+        schedulePending()
     }
 
     func updateRenderSize(_ size: CGSize) {
         guard size.width > 0, size.height > 0, size != renderSize else { return }
         renderSize = size
-        guard let currentSnapshot else { return }
-        pendingSnapshot = currentSnapshot
+        guard let acceptedInput else { return }
+        pendingInput = acceptedInput
         schedulePending()
     }
 
     func clear() {
         workID &+= 1
-        renderTask?.cancel()
-        renderTask = nil
-        currentSnapshot = nil
-        pendingSnapshot = nil
-        currentLayout = nil
+        if !isComputing {
+            renderTask?.cancel()
+            renderTask = nil
+        }
+        acceptedInput = nil
+        pendingInput = nil
+        renderedInput = nil
         lastRenderUptime = nil
         ptsOrigin = nil
         lastPTSTick = nil
@@ -233,21 +298,38 @@ final class SubtitleRenderer: SubtitleRendering {
     }
 
     func waitForClear() async {
+        let clearTask = self.clearTask
+        let renderTask = self.renderTask
         await clearTask?.value
+        await renderTask?.value
     }
 
     private func schedulePending() {
-        let interval = UInt64(1_000_000_000 / max(RuntimePolicy.maximumRenderFPS, 1))
-        let deadline = max(clock.now().uptimeNanoseconds, (lastRenderUptime ?? 0) &+ interval)
-        schedule(deadline: deadline, heartbeat: false)
+        guard pendingInput != nil else {
+            scheduleHeartbeat()
+            return
+        }
+        if isComputing {
+            workID &+= 1
+            return
+        }
+        let now = clock.now().uptimeNanoseconds
+        let deadline: UInt64
+        if let lastRenderUptime {
+            let interval = UInt64(1_000_000_000 / max(RuntimePolicy.maximumRenderFPS, 1))
+            deadline = max(now, lastRenderUptime &+ interval)
+        } else {
+            deadline = now
+        }
+        startTask(deadline: deadline)
     }
 
     private func scheduleHeartbeat() {
-        guard currentLayout != nil, let lastRenderUptime else { return }
-        schedule(deadline: lastRenderUptime &+ 1_000_000_000, heartbeat: true)
+        guard renderedInput != nil, pendingInput == nil, !isComputing, let lastRenderUptime else { return }
+        startTask(deadline: lastRenderUptime &+ 1_000_000_000)
     }
 
-    private func schedule(deadline: UInt64, heartbeat: Bool) {
+    private func startTask(deadline: UInt64) {
         workID &+= 1
         let expectedWork = workID
         renderTask?.cancel()
@@ -260,33 +342,63 @@ final class SubtitleRenderer: SubtitleRendering {
             } catch {
                 return
             }
-            guard let self, self.workID == expectedWork else { return }
-            let drewFrame = heartbeat ? self.draw(self.currentLayout) : self.drawPending()
-            if drewFrame { self.scheduleHeartbeat() }
+            guard let self, self.workID == expectedWork, let job = self.makeJob() else { return }
+            self.isComputing = true
+            do {
+                let frame = try await self.builder.make(
+                    input: job.input,
+                    size: job.size,
+                    presentationTimeStamp: job.presentationTimeStamp
+                )
+                self.finish(frame, job: job, workID: expectedWork)
+            } catch {
+                self.finishBuildFailure(error, workID: expectedWork)
+            }
         }
     }
 
-    private func drawPending() -> Bool {
-        guard let pendingSnapshot else { return false }
-        return draw(SubtitleLayout(snapshot: pendingSnapshot, size: renderSize))
+    private func makeJob() -> RenderJob? {
+        guard let activeSessionID, let input = pendingInput ?? renderedInput else { return nil }
+        return RenderJob(
+            sessionID: activeSessionID,
+            input: input,
+            size: renderSize,
+            presentationTimeStamp: nextPTS(now: clock.now().uptimeNanoseconds)
+        )
     }
 
-    private func draw(_ layout: SubtitleLayout?) -> Bool {
-        guard let layout else { return false }
+    private func finish(_ frame: SubtitleFrame, job: RenderJob, workID: UInt64) {
+        isComputing = false
+        guard self.workID == workID, activeSessionID == job.sessionID else {
+            schedulePending()
+            return
+        }
         do {
-            let now = clock.now().uptimeNanoseconds
-            let frame = try SubtitleFrame(layout: layout, presentationTimeStamp: nextPTS(now: now))
             try output.enqueue(frame)
-            currentLayout = layout
-            pendingSnapshot = nil
-            lastRenderUptime = now
-            return true
+            renderedInput = job.input
+            if pendingInput == job.input { pendingInput = nil }
+            lastRenderUptime = clock.now().uptimeNanoseconds
+            if pendingInput == nil {
+                scheduleHeartbeat()
+            } else {
+                schedulePending()
+            }
         } catch {
             let failure = error as? FailureCode ?? .pipFailed
             clear()
             onFailure?(failure)
-            return false
         }
+    }
+
+    private func finishBuildFailure(_ error: any Error, workID: UInt64) {
+        isComputing = false
+        guard self.workID == workID else {
+            schedulePending()
+            return
+        }
+        let failure = error as? FailureCode ?? .pipFailed
+        clear()
+        onFailure?(failure)
     }
 
     private func nextPTS(now: UInt64) -> CMTime {
