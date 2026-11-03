@@ -111,6 +111,7 @@ final class CloudURLProtocol: URLProtocol, @unchecked Sendable {
                 httpVersion: "HTTP/1.1", headerFields: script.headers
             )!
             instance.client?.urlProtocol(instance, wasRedirectedTo: redirectRequest, redirectResponse: response)
+            instance.client?.urlProtocolDidFinishLoading(instance)
             return
         }
         let response = HTTPURLResponse(

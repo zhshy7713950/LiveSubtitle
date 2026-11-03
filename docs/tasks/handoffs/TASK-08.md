@@ -38,7 +38,9 @@
 | macOS 同源 host checks | Swift 6 完整并发检查 | 16 组通过：endpoint 2、SSE 2、translator／connection 12；含 CR/LF/CRLF 全分块点、边界、取消与 late callback | 不证明 iOS 运行时行为 |
 | macOS AddressSanitizer / ThreadSanitizer host checks | translator／connection 各 12 组 | 退出码均为 0 | 不证明真实服务或 iOS 行为 |
 | `./scripts/test.sh '<simulator-UDID>' -only-testing:LiveSubtitleTests` | `simctl list runtimes` 为空 | 未执行 | 无可用 iOS 模拟器运行时；不以测试 bundle 编译代替测试执行 |
-| 任务卡逐项验收 | 固定本地响应 | 七项具名测试均有主机行为证据；HTTP 状态均核对单请求、无自动重试 | iOS 全套测试和真实服务未验证 |
+| 真机 `xcodebuild ... test`，TASK-08 三个测试类 | iOS 27.2 / Xcode 27.2；固定本地响应 | 16 项全部通过；最终一轮 0.086 秒，无跳过、失败或超时 | 初轮重定向夹具在拒绝后未结束响应，等待 60 秒超时；已修正夹具并重跑，不访问真实服务 |
+| 真机 `xcodebuild ... test -only-testing:LiveSubtitleTests` | iOS 27.2 / Xcode 27.2 | 16 个 suite、123 项测试全部通过，无跳过或失败 | 不代表真实 AI 服务、后台生命周期或完整 G0 通过 |
+| 任务卡逐项验收 | 固定本地响应 | 七项具名测试均有主机与真机行为证据；HTTP 状态均核对单请求、无自动重试 | 真实服务未验证 |
 | 独立只读审查及修正回归 | 全分支 diff | 已修复 readKey/cancelAll 竞态、JSON finish_reason、CR-only SSE、URL 实际 Key 防泄漏及 MonotonicClock 节流；新增回归红→绿 | 未做第二轮独立复审，以新增回归和全套检查验证修正 |
 
 ## 契约请求
@@ -48,6 +50,6 @@
 ## 未验证与已知问题
 
 - 未连接任何真实 Chat Completions 服务；不同厂商的实际鉴权、SSE、finish_reason 和错误响应兼容性仍需集成验证，不自动重试真实字幕请求。
-- 无 iOS 模拟器运行时，因此当前全量 Swift Testing 未在 iOS 执行；没有真机网络、后台生命周期或完整 G0 证据。消费者取消测试覆盖输出与 pending 竞态，但未直接记录系统 `URLProtocol.stopLoading` 回调，系统级释放仍需平台验证。
+- 真机已执行固定 URLProtocol 的 TASK-08 与全量测试；真实 AI 服务、后台生命周期和完整 G0 仍未验证。模拟器仍无可用运行时。消费者取消测试覆盖输出与 pending 竞态，但未直接记录系统 `URLProtocol.stopLoading` 回调，系统级释放仍需平台验证。
 - TASK-13 需用同一 CredentialStoring 实现分别装配 translator 与 connection tester；模式切换、配置变更、调度取消及 identity 失效由对应模块负责。
 - 未推送、未合并 main。
