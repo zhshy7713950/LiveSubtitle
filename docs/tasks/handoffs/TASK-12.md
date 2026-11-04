@@ -1,9 +1,9 @@
 # TASK-12 交接
 
 - 基线 commit：`29aae8d76ca7465f827f98a430fe5864e7af5a8f`（本地 `main`）
-- 任务分支 / commit：`worktree-task12` / 本提交（实现与交接同一 commit）
+- 任务分支 / commit：`worktree-task12` / 见分支最终提交（含 `origin/main` 同步与真机验证交接）
 - 前置报告：`docs/reports/g0-device-report.md` 仍明确为“未完成；G0 尚未通过”；本任务按任务卡允许的方式使用 Ports 和任务内 doubles 独立开发，不宣称完整链路可用。
-- 状态：待审查（独立审查的 Critical/Important 已逐项 RED→GREEN 修复；等待集成人审查）
+- 状态：待审查（独立审查问题已修复；合并后全量真机单元测试通过，等待集成人审查）
 
 ## 改动
 
@@ -43,11 +43,14 @@
 | `bash build/features-host-check.sh` | Swift 6 strict-concurrency + warnings-as-errors；macOS 主机直接编译真实 ViewModel 与 Contracts；七项任务卡具名检查 + 十一项审查回归 | 18/18 通过；最终代码另重复运行 20/20 轮通过 | 不覆盖 iOS SwiftUI 渲染、系统资源或设备行为；脚本与日志位于本机忽略的 `build/` |
 | 既有 Session host checks | Swift 6 strict-concurrency；17 项纯逻辑回归 | 17/17 通过 | 不是 iOS 测试执行或 SDK/设备证据 |
 | 既有 G0 host checks | Swift 6 strict-concurrency；13 项纯逻辑回归 | 13/13 通过 | 不代表 G0 真机验收通过 |
-| 最终 `./scripts/verify.sh` | 文档/plist/scheme 检查；iOS Debug、iOS Release、generic simulator App 和测试 bundle 编译 | 退出码 0，全部 build succeeded | 仅编译，不证明签名、测试执行或 G0 |
+| 最终及合并后 `./scripts/verify.sh` | 文档/plist/scheme 检查；iOS Debug、iOS Release、generic simulator App 和测试 bundle 编译 | 两次均退出码 0，全部 build succeeded | 仅编译，不证明签名、测试执行或 G0 |
 | `xcodebuild ... analyze`（generic iOS Simulator） | 本 worktree 独立 `build/analyze` | `ANALYZE SUCCEEDED`；无源码 warning/error | 仅有未使用 AppIntents 的 metadata 跳过提示，不是行为测试 |
+| 真机 `xcodebuild ... test -only-testing:<三个 Features suites>` | 2026-11-04，已连接 iPhone；TASK-12 实现 commit | 实际执行 18 项、3 suites，全部通过，无跳过；`TEST SUCCEEDED` | XCTest 空入口显示 0 tests，Swift Testing 另行报告真实 18 项；不是 UI/G0 验收 |
+| 合并 `origin/main` 后真机 `xcodebuild ... test` | 合并 commit `2a50737`；当前全量 Swift Testing | 实际执行 179 项、23 suites，全部通过，无跳过；`TEST SUCCEEDED` | Xcode 随后收集设备诊断时另报错，不影响已完成的测试结果；不据此宣称完整 G0 |
+| `codesign --verify --deep --strict`、`devicectl install`、`process launch --activate` | 合并后的 Debug App；本机忽略签名配置 | 签名校验、安装和前台启动均成功 | 仅证明 App 安装启动；Features 尚未由 TASK-13 装配，未操作其 UI |
 | `./scripts/test.sh '<simulator-UDID>' -only-testing:LiveSubtitleTests` | 本机 `simctl list runtimes` 为空 | 未执行 | 无可用 iOS 27+ 模拟器运行时；不能提供有效 UDID |
-| 任务卡逐项验收 | 七项具名 ViewModel 行为检查，另加十一项竞态/故障回归 | 主机逻辑 18/18 通过 | iOS 测试 target 中的同一批测试尚未实际执行 |
-| SwiftUI 手动交互、真实 Keychain/网络/语言资源、真机/G0 | — | 未执行 | 本任务不修改 App 装配；无模拟器，G0 前置报告未完成 |
+| 任务卡逐项验收 | 七项具名 ViewModel 行为检查，另加十一项竞态/故障回归 | 主机逻辑 18/18；真机 18/18、3 suites 实际执行通过 | 不代表 SwiftUI 手动交互或完整 G0 验收 |
+| SwiftUI 手动交互、真实 Keychain/网络/语言资源、完整真机/G0 | — | 未执行 | 本任务不修改 App 装配；无模拟器，G0 前置报告未完成 |
 
 ## 契约请求
 
@@ -55,7 +58,7 @@
 
 ## 未验证与已知问题
 
-- 没有实际 iOS 测试执行、SwiftUI 交互、真实资源下载、Keychain、连接服务或设备证据；不得将 generic simulator `build-for-testing` 或主机 18/18 写成这些场景已通过。
+- 已有真实 iPhone 单元测试、签名安装和前台启动证据；仍没有 Features SwiftUI 手动交互、真实资源下载、Keychain/连接服务手工验收或完整 G0 证据。不得将 generic simulator `build-for-testing`、主机 18/18 或真机单元测试写成这些场景已通过。
 - G0 尚未通过；本交付不证明采集、识别、翻译、PiP 或十五分钟持续运行可用。
 - TASK-13 需完成真实依赖装配、语言准备 host 嵌入、CloudSettings 导航入口、生命周期与系统事件处理，并在有 iOS 27+ 模拟器后执行全量 `scripts/test.sh`。
 - 独立只读审查提出 1 项 Critical、6 项 Important，均已添加确定性失败测试并修复，最终 18/18；未进行第二次独立审查。三项 Minor 延后：读取/刷新失败的文案与状态可更准确；配置变更后的“启用 AI”操作可更直接；running 等活跃 phase 的开始按钮仍应禁用，当前由协调器防御重复 start。
