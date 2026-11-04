@@ -1,4 +1,7 @@
 #if DEBUG && !targetEnvironment(simulator)
+#if !G0_HOST_CHECK
+@testable import LiveSubtitle
+#endif
 import Foundation
 import ScreenCaptureKit
 import OSLog

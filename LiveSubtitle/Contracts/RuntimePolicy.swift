@@ -29,4 +29,6 @@ enum RuntimePolicy {
     static let sseEventByteLimit = 64 * 1_024
     static let responseByteLimit = 256 * 1_024
     static let maximumRenderFPS = 10
+    /// In-memory diagnostic ring; never persisted or automatically exported.
+    static let diagnosticEventLimit = 256
 }

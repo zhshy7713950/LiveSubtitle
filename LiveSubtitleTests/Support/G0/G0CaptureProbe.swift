@@ -1,4 +1,7 @@
 #if DEBUG && !targetEnvironment(simulator)
+#if !G0_HOST_CHECK
+@testable import LiveSubtitle
+#endif
 import AVFoundation
 import ScreenCaptureKit
 import Synchronization
