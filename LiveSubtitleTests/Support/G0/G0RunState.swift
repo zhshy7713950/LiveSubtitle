@@ -1,4 +1,7 @@
 #if DEBUG
+#if !G0_HOST_CHECK
+@testable import LiveSubtitle
+#endif
 import Foundation
 
 struct G0Transcript: Sendable {
