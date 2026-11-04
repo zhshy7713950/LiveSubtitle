@@ -42,7 +42,9 @@
 | 既有 G0 host checks | 13 项 | 全部通过 | 不替代 G0 真机链路 |
 | 最终 `./scripts/verify.sh` | Xcode / SDK 27.2 | 退出码 0；文档、plist、iOS Debug、Release、generic simulator App 与测试 bundle 编译通过 | 不执行行为测试 |
 | `./scripts/test.sh '<simulator-UDID>' -only-testing:LiveSubtitleTests` | `simctl list devices available` 为空 | 未执行 | 无可用 iOS 27 模拟器；不以测试 bundle 编译代替测试执行 |
-| 任务卡逐项验收 | 固定 snapshot、fake clock、系统 doubles | 五项具名验收均有主机行为证据，另有十一项边界回归 | 真实设备 PiP 未验证 |
+| 真机 `xcodebuild ... test -only-testing:` 两个 Presentation 套件 | iOS 27.2 / Xcode 27.2；2 suites／16 tests | 16 项实际执行通过，0 跳过 | 测试 target 行为证据，不等同真实 PiP 界面验收 |
+| 真机 `xcodebuild ... -parallel-testing-enabled NO -only-testing:LiveSubtitleTests test` | 同一设备；20 suites／161 tests | 161 项实际执行通过，0 失败、0 跳过 | 默认并行下 Cloud `testProvisionalThrottle` 曾失败，单项及禁用并行后的全量均通过 |
+| 任务卡逐项验收 | 固定 snapshot、fake clock、系统 doubles 及真机测试 target | 五项具名验收均有主机及真机行为证据，另有十一项边界回归 | 真实设备 PiP 界面与 Chrome 链路未验证 |
 
 主机复现命令：
 
@@ -57,7 +59,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
 
 ## 独立审查与修复
 
-- fresh reviewer 初审为 No：1 项 Critical 为每帧重设 synchronizer 时间轴；3 项 Important 为重复快照持续重绘、旧会话快照缺少准入、布局／像素同步占用 MainActor。四项均新增失败测试后修复，最终 16 项同源检查、100 轮重复运行、ASan／TSan 和完整工程检查通过。
+- fresh reviewer 初审为 No：1 项 Critical 为每帧重设 synchronizer 时间轴；3 项 Important 为重复快照持续重绘、旧会话快照缺少准入、布局／像素同步占用 MainActor。四项均新增失败测试后修复，最终 16 项同源检查、100 轮重复运行、ASan／TSan、完整工程检查及真机 161 项测试通过。
 - 暂缓 Minor：慢消费者下 PiP 事件输出会以 `Task.yield` 重试 dropped，内存有界但可能产生调度轮询；后续应改为消费进展显式唤醒。
 - 暂缓 Minor：空间严重不足且带状态行时，partial group 的 8 点组间距可能侵入状态行或底部留白；需补短高度布局用例并统一 fitting／positioning 高度计算。
 - 设备判断：保留 supported／possible 一次性前置检查，若真机证明 possible 依赖首帧，可能导致启动失败，需在 TASK-14 调整为观察或等待机制。
@@ -71,6 +73,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
 ## 未验证与已知问题
 
 - G0 仍未完成；未验证真实 iPhone 上 PiP 启动、恢复、替换、拖动、缩放、Chrome 播放器冲突、后台持续显示或完整停止链路。`isPictureInPictureSuspended` 的真实系统时序必须由 TASK-14 核对。
-- 最终源码没有模拟器或真机测试 target 执行证据；主机检查使用同一布局、调度和协调器源码，真实 Receiver／AVKit 适配器仅有 SDK 编译证据。
+- 没有模拟器测试 target 执行证据；已有真机 20 suites／161 tests 全部通过的测试 target 证据。真实 Receiver／AVKit 界面、Chrome 采音和完整 G0 仍只有 SDK 编译及固定输入测试证据，未做人工场景验收。
+- 默认并行的全量真机运行中，既有 Cloud `testProvisionalThrottle` 出现两次 `throttling dropped final completion`，单独复跑及 Cloud 主机测试通过；使用 `-parallel-testing-enabled NO` 后全量 161 项通过。该跨 suite 并行波动未在本任务修改，集成人后续应核查测试隔离。
 - TASK-13 需在 start 抛出或收到 failed／closed／replaced 时沿用 Session 停止协议；恢复界面后再次离开 App 时，可对同一 sessionID 调用 start，保留当前字幕并更换旧 PiP adapter。
 - 不把本任务的固定输入、编译和 sanitizer 结果写成 Chrome、双 PiP 或十五分钟后台能力通过。
