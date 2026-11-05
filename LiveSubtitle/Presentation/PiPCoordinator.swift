@@ -26,6 +26,21 @@ protocol PiPSystemAdapting: AnyObject {
 }
 
 @MainActor
+func waitForPiPReadiness(clock: any MonotonicClock, isPossible: () -> Bool) async throws {
+    func nanoseconds(_ duration: Duration) -> UInt64 {
+        UInt64(duration.components.seconds) * 1_000_000_000 + UInt64(duration.components.attoseconds / 1_000_000_000)
+    }
+    let deadline = clock.now().uptimeNanoseconds + nanoseconds(RuntimePolicy.pipReadinessTimeout)
+    while !isPossible() {
+        try Task.checkCancellation()
+        let now = clock.now().uptimeNanoseconds
+        guard now < deadline else { throw FailureCode.pipFailed }
+        try await clock.sleep(until: .init(uptimeNanoseconds: min(deadline, now + nanoseconds(RuntimePolicy.pipReadinessPollInterval))))
+    }
+    try Task.checkCancellation()
+}
+
+@MainActor
 extension PiPSystemAdapting {
     func waitUntilPossible() async throws {
         guard isPossible else { throw FailureCode.pipFailed }
@@ -310,10 +325,12 @@ final class PiPCoordinator: PiPControlling {
 final class AVPiPSystemAdapter: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate,
                                 @preconcurrency AVPictureInPictureControllerDelegate, PiPSystemAdapting {
     private var controller: AVPictureInPictureController?
+    private let clock: any MonotonicClock
     private var suspensionObservation: NSKeyValueObservation?
     var eventHandler: ((PiPSystemEvent) -> Void)?
 
-    init(layer: AVSampleBufferDisplayLayer) {
+    init(layer: AVSampleBufferDisplayLayer, clock: any MonotonicClock = PresentationSystemClock()) {
+        self.clock = clock
         super.init()
         if AVPictureInPictureController.isPictureInPictureSupported() {
             let source = AVPictureInPictureController.ContentSource(
@@ -338,13 +355,7 @@ final class AVPiPSystemAdapter: NSObject, AVPictureInPictureSampleBufferPlayback
     var isSuspended: Bool { controller?.isPictureInPictureSuspended ?? false }
 
     func waitUntilPossible() async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: RuntimePolicy.pipReadinessTimeout)
-        while !isPossible {
-            try Task.checkCancellation()
-            guard clock.now < deadline else { throw FailureCode.pipFailed }
-            try await clock.sleep(until: min(deadline, clock.now.advanced(by: RuntimePolicy.pipReadinessPollInterval)))
-        }
+        try await waitForPiPReadiness(clock: clock) { self.isPossible }
     }
 
     func start() { controller?.startPictureInPicture() }

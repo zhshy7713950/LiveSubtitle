@@ -311,3 +311,29 @@ extension PiPCoordinatorTests {
     }
 }
 #endif
+
+#if !TASK11_HOST_CHECK
+extension PiPCoordinatorTests {
+    @Test @MainActor func testReadinessDeadlineUsesInjectedClock() async throws {
+        let clock = Task10Clock()
+        let probe = PiPReadinessProbe()
+        let task = Task { @MainActor in
+            try await waitForPiPReadiness(clock: clock) { probe.checked = true; return false }
+        }
+        while !probe.checked { await Task.yield() }
+        clock.advance(toMilliseconds: 3_000)
+        do { try await task.value; Issue.record("Unready PiP passed its deadline") }
+        catch let error as FailureCode { #expect(error == .pipFailed) }
+    }
+    @Test @MainActor func testReadinessCancellationReleasesWaiter() async throws {
+        let task = Task { @MainActor in try await waitForPiPReadiness(clock: Task10Clock()) { false } }
+        task.cancel()
+        do { try await task.value; Issue.record("Cancelled readiness succeeded") }
+        catch { #expect(error is CancellationError) }
+    }
+}
+#endif
+
+#if !TASK11_HOST_CHECK
+@MainActor private final class PiPReadinessProbe { var checked = false }
+#endif
