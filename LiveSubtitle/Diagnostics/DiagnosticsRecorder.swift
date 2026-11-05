@@ -26,6 +26,7 @@ struct DiagnosticSample: Sendable {
             }
             value = "stage=\(name) ns=\(nanoseconds)"
         case .residentMemory(let bytes): value = "resident_bytes=\(bytes)"
+        case .thermalState(let state): value = "thermal_state=\(state.rawValue)"
         }
         return "session=\(sessionID.uuidString) uptime_ns=\(instant.uptimeNanoseconds) \(value)"
     }

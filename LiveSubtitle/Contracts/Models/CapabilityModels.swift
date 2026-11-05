@@ -33,6 +33,11 @@ enum DiagnosticEvent: Sendable {
     case droppedJob
     case stageLatency(stage: DiagnosticStage, nanoseconds: UInt64)
     case residentMemory(bytes: UInt64)
+    case thermalState(DiagnosticThermalState)
+}
+
+enum DiagnosticThermalState: String, Sendable {
+    case nominal, fair, serious, critical, unknown
 }
 
 enum DiagnosticStage: Sendable {
