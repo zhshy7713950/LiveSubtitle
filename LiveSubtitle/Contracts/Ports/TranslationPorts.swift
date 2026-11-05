@@ -26,6 +26,8 @@ protocol CaptionStoring: Sendable {
     func begin(identity: SessionIdentity, display: DisplayPreferences) async
     func advanceIdentity(_ identity: SessionIdentity) async
     func upsert(_ segment: CaptionSegment) async
+    /// Delete a superseded row before accepting further translation results.
+    func remove(segmentID: UUID) async
     func apply(_ update: TranslationUpdate, for job: TranslationJob, now: MonotonicInstant) async
     func setDisplay(_ preferences: DisplayPreferences) async
     func snapshot(mode: EffectiveMode, status: SubtitleStatus) async -> SubtitleSnapshot?

@@ -16,7 +16,9 @@ func sessionEventually(
     _ message: String,
     condition: () async -> Bool
 ) async throws {
-    for _ in 0..<500 {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(2))
+    while clock.now < deadline {
         if await condition() { return }
         await Task.yield()
     }
@@ -107,7 +109,7 @@ final class FakeAudioSource: AudioSource {
     private(set) var stopCount = 0
     private(set) var configurations: [CaptureConfig] = []
     private var shouldSuspendStart = false
-    private var startContinuation: CheckedContinuation<Void, Never>?
+    private var startContinuation: CheckedContinuation<Void, any Error>?
 
     func start(config: CaptureConfig) async throws -> AsyncStream<AudioSourceEvent> {
         startCount += 1
@@ -115,8 +117,14 @@ final class FakeAudioSource: AudioSource {
         if cancelStart { throw CancellationError() }
         if shouldSuspendStart {
             shouldSuspendStart = false
-            await withCheckedContinuation { continuation in
-                startContinuation = continuation
+            try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                try await withCheckedThrowingContinuation { continuation in
+                    startContinuation = continuation
+                }
+                try Task.checkCancellation()
+            } onCancel: {
+                Task { @MainActor in self.releaseStart() }
             }
         }
         return AsyncStream(bufferingPolicy: .bufferingOldest(64)) { _ in }
@@ -125,7 +133,7 @@ final class FakeAudioSource: AudioSource {
     func stop() async { stopCount += 1 }
     func suspendNextStart() { shouldSuspendStart = true }
     func releaseStart() {
-        startContinuation?.resume()
+        startContinuation?.resume(returning: ())
         startContinuation = nil
     }
 }
@@ -285,6 +293,11 @@ actor FakeCaptionStoring: CaptionStoring {
         }
     }
 
+    func remove(segmentID: UUID) async {
+        segments.removeValue(forKey: segmentID)
+        order.removeAll { $0 == segmentID }
+    }
+
     func apply(_ update: TranslationUpdate, for job: TranslationJob, now: MonotonicInstant) async {
         appliedUpdates.append(update)
     }
@@ -344,12 +357,14 @@ final class FakeSubtitleRendering: SubtitleRendering {
 
 @MainActor
 final class FakePiPControlling: PiPControlling {
+    var startFailure: FailureCode?
     private let events = SessionStreamBox<PiPEvent>()
     private(set) var startedSessionIDs: [UUID] = []
     private(set) var stoppedSessionIDs: [UUID] = []
 
     func start(sessionID: UUID) async throws -> AsyncStream<PiPEvent> {
         startedSessionIDs.append(sessionID)
+        if let startFailure { throw startFailure }
         return events.makeStream()
     }
 

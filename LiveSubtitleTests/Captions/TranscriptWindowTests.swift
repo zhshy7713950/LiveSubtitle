@@ -171,11 +171,42 @@ private func checkCheckpointIndexRemainsBounded() throws {
         try task06Require(normalizer.checkpointCount <= RuntimePolicy.retainedSegmentLimit,
                           "checkpoint indexes grew with total utterances instead of the retained window")
     }
-    try task06Require(normalizer.requiresDiscontinuity,
-                      "checkpoint overflow must explicitly request a rebuild instead of silently dropping old-result protection")
+    try task06Require(!normalizer.requiresDiscontinuity,
+                      "checkpoint rollover must retain valid new text without resetting old-result protection")
+    let old = task06Event(text: "old", range: task06Range(0, 1_000), receivedAt: task06Instant(100_000))
+    try task06Require(normalizer.normalize(old) == nil, "retired audio resurfaced after checkpoint compaction")
+    let current = task06Event(text: "new", range: task06Range(100_000, 101_000), receivedAt: task06Instant(101_000))
+    try task06Require(normalizer.normalize(current)?.text == "new", "rollover discarded current audio")
+}
+
+private func checkCompactedCheckpointClipsCumulativeOldText() throws {
+    var normalizer = TranscriptNormalizer()
+    let firstID = UUID()
+    for index in 0..<11 {
+        let id = index == 0 ? firstID : UUID()
+        let event = task06Event(utteranceID: id, text: "x",
+            range: task06Range(Int64(index) * 1_000, Int64(index + 1) * 1_000),
+            isFinal: true, receivedAt: task06Instant(UInt64(index) * 1_000))
+        _ = normalizer.normalize(event)
+        normalizer.consume(utteranceID: id, through: event.audioRange.end)
+    }
+    let revision = task06Event(utteranceID: firstID, revision: 1, text: "xy",
+        range: task06Range(0, 2_000), receivedAt: task06Instant(12_000))
+    try task06Require(normalizer.normalize(revision)?.text == "y",
+                      "compacted checkpoint reappended the already-consumed prefix")
+    let coarse = task06Event(utteranceID: firstID, revision: 2, text: "coarse",
+        range: task06Range(0, 2_000),
+        spans: [TranscriptSpan(characterRange: 0..<6, audioRange: task06Range(0, 2_000))],
+        receivedAt: task06Instant(13_000))
+    try task06Require(normalizer.normalize(coarse) == nil && normalizer.requiresDiscontinuity,
+                      "compacted checkpoint guessed timing inside a coarse span")
+    normalizer.reset()
+    try task06Require(normalizer.normalize(task06Event(text: "reset", range: task06Range(0, 1_000),
+                        receivedAt: task06Instant(0)))?.text == "reset", "reset retained old audio watermark")
 }
 
 private func runTranscriptWindowChecks() async throws {
+    try checkCompactedCheckpointClipsCumulativeOldText()
     try checkTranscriptWindowUsesGraphemeCharacterLimit()
     try checkTranscriptWindowDropsExpiredEvents()
     try checkConsumedCheckpointDoesNotReappend()
@@ -194,11 +225,12 @@ private struct Task06HostChecks {
         try await runTranscriptWindowChecks()
         try await runCaptionStoreChecks()
         try await runCaptionSegmenterChecks()
-        print("28 TASK-06 host checks passed; no SDK/device behavior tested.")
+        print("31 TASK-06 host checks passed; no SDK/device behavior tested.")
     }
 }
 #else
 struct TranscriptWindowTests {
+    @Test func testCompactedCheckpointClipsCumulativeOldText() throws { try checkCompactedCheckpointClipsCumulativeOldText() }
     @Test func testWindowUsesGraphemeCharacterLimit() throws {
         try checkTranscriptWindowUsesGraphemeCharacterLimit()
     }

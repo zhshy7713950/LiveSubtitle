@@ -498,7 +498,27 @@ private func checkNormalizerDiscontinuityClearsClosedSegments() async throws {
     continuation.finish()
 }
 
+private func checkCheckpointRolloverEmitsEveryFinal() async throws {
+    let segmenter = CaptionSegmenter(clock: Task06Clock())
+    let pair = AsyncStream<SpeechEvent>.makeStream(bufferingPolicy: .bufferingOldest(32))
+    let output = await segmenter.start(input: pair.stream)
+    for index in 0..<25 {
+        pair.continuation.yield(.transcript(task06Event(text: "Sentence \(index).",
+            range: task06Range(Int64(index) * 1_000, Int64(index + 1) * 1_000),
+            isFinal: true, receivedAt: task06Instant(UInt64(index) * 1_000))))
+    }
+    pair.continuation.finish()
+    var texts: [String] = []
+    for await event in output {
+        if case .upsert(let segment) = event { texts.append(segment.sourceText) }
+    }
+    try task06Require(texts == (0..<25).map { "Sentence \($0)." },
+                      "checkpoint rollover lost or duplicated a valid final sentence")
+    await segmenter.reset()
+}
+
 func runCaptionSegmenterChecks() async throws {
+    try await checkCheckpointRolloverEmitsEveryFinal()
     try await checkRevisionReplacesSameSegment()
     try await checkTimedSegmentation()
     try await checkNoNextSpeechCallbackStillEmits()
@@ -515,6 +535,7 @@ func runCaptionSegmenterChecks() async throws {
 
 #if !TASK06_HOST_CHECK
 struct CaptionSegmenterTests {
+    @Test func testCheckpointRolloverEmitsEveryFinal() async throws { try await checkCheckpointRolloverEmitsEveryFinal() }
     @Test func testRevisionReplacesSameSegment() async throws { try await checkRevisionReplacesSameSegment() }
     @Test func testTimedSegmentation() async throws { try await checkTimedSegmentation() }
     @Test func testNoNextSpeechCallbackStillEmits() async throws { try await checkNoNextSpeechCallbackStillEmits() }

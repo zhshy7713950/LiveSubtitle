@@ -60,6 +60,10 @@ actor CaptionStore: CaptionStoring {
                                          translationState: state)
     }
 
+    func remove(segmentID: UUID) {
+        segments.removeAll { $0.segmentID == segmentID }
+    }
+
     func setDisplay(_ preferences: DisplayPreferences) {
         display = preferences
     }

@@ -410,6 +410,74 @@ func testProfileChangeThenExplicitAIUsesNewRevision() async throws {
     try sessionRequire(calls.last?.profile == newProfile, "explicit AI used the old profile")
 }
 
+func testStartupFailurePreservesSafeReasonAfterCleanup() async throws {
+    let rig = await SessionTestRig.make()
+    await MainActor.run { rig.pip.startFailure = .pipFailed }
+    await rig.prepareAndStart()
+    let status = await rig.coordinator.currentStatus
+    try sessionRequire(status.phase == .failed && status.failure == .pipFailed,
+                       "startup cleanup lost the safe failure")
+    try sessionRequire(status.identity == nil, "failed startup kept identity")
+    try sessionRequire(await rig.audioSource.stopCount == 1, "failed startup leaked capture")
+    try sessionRequire(await rig.store.clearCount == 1, "failed startup retained captions")
+}
+
+func testStopCancelsPendingPickerBeforeWaiting() async throws {
+    let rig = await SessionTestRig.make()
+    await rig.coordinator.prepare(config: makeSessionConfig())
+    await rig.audioSource.suspendNextStart()
+    let start = Task { await rig.coordinator.start() }
+    try await sessionEventually("picker did not begin") { await rig.audioSource.startCount == 1 }
+    let stop = Task { await rig.coordinator.stop(reason: .deviceLocked) }
+    do {
+        try await sessionEventually("stop deadlocked waiting for the pending picker") {
+            await rig.coordinator.currentStatus.phase == .idle
+        }
+    } catch {
+        await rig.audioSource.releaseStart()
+        await start.value
+        await stop.value
+        throw error
+    }
+    await start.value
+    await stop.value
+    let status = await rig.coordinator.currentStatus
+    try sessionRequire(status.identity == nil && status.failure == nil, "lifecycle cancellation became failure")
+    try sessionRequire(await rig.speech.startCount == 0, "cancelled picker started speech")
+    try sessionRequire(await rig.pip.startedSessionIDs.isEmpty, "cancelled picker started PiP")
+    await rig.prepareAndStart()
+    try sessionRequire(await rig.coordinator.currentStatus.phase == .running, "cancelled startup prevented restart")
+    await rig.coordinator.stop(reason: .user)
+}
+
+func testRemovedSegmentDisappearsAndRejectsLateJobs() async throws {
+    let rig = await SessionTestRig.make()
+    await rig.prepareAndStart()
+    let identity = try await sessionUnwrapIdentity(rig.coordinator)
+    let segment = makeCaptionSegment()
+    await rig.segmenter.emit(.upsert(segment))
+    try await sessionEventually("segment was not displayed") {
+        await rig.renderer.snapshots.last?.segments.map(\.segmentID) == [segment.segmentID]
+    }
+    await rig.segmenter.emit(.remove(segmentID: segment.segmentID))
+    try await sessionEventually("removed segment remains displayed") {
+        await rig.renderer.snapshots.last?.segments.isEmpty == true
+    }
+    let retained = makeCaptionSegment()
+    await rig.segmenter.emit(.upsert(retained))
+    try await sessionEventually("retained row was not submitted") { await rig.scheduler.submittedSegments.count == 2 }
+    let job = makeTranslationJob(identity: identity, segment: segment)
+    let currentJob = makeTranslationJob(identity: identity, segment: retained)
+    await rig.scheduler.emit(.translation(job: job, update: makeTranslationUpdate(job: job, provider: .local)))
+    await rig.scheduler.emit(.failed(job: job, reason: .localTranslationFailed))
+    await rig.scheduler.emit(.translation(job: currentJob, update: makeTranslationUpdate(job: currentJob, provider: .local)))
+    try await sessionEventually("scheduling events were not consumed") { await rig.store.appliedUpdates.count == 1 }
+    try sessionRequire(await rig.store.appliedUpdates.map(\.segmentID) == [retained.segmentID],
+                       "removed segment accepted late translation")
+    try sessionRequire(await rig.coordinator.currentStatus.phase == .running, "removed segment failure stopped session")
+    await rig.coordinator.stop(reason: .user)
+}
+
 func sessionUnwrapIdentity(_ coordinator: SessionCoordinator) async throws -> SessionIdentity {
     guard let identity = await coordinator.currentStatus.identity else {
         throw SessionTestFailure(message: "missing active identity")
@@ -422,6 +490,9 @@ func sessionUnwrapIdentity(_ coordinator: SessionCoordinator) async throws -> Se
 private struct SessionHostChecks {
     static func main() async throws {
         let checks: [(String, () async throws -> Void)] = [
+            ("testStartupFailurePreservesSafeReasonAfterCleanup", testStartupFailurePreservesSafeReasonAfterCleanup),
+            ("testStopCancelsPendingPickerBeforeWaiting", testStopCancelsPendingPickerBeforeWaiting),
+            ("testRemovedSegmentDisappearsAndRejectsLateJobs", testRemovedSegmentDisappearsAndRejectsLateJobs),
             ("testStopInvalidatesBeforeCancellation", testStopInvalidatesBeforeCancellation),
             ("testRepeatedStopReleasesOnce", testRepeatedStopReleasesOnce),
             ("testOldSessionCallbacksCannotAffectRestart", testOldSessionCallbacksCannotAffectRestart),
@@ -459,6 +530,9 @@ private struct SessionHostChecks {
 }
 #else
 struct SessionCoordinatorTests {
+    @Test func startupFailurePreservesSafeReasonAfterCleanup() async throws { try await testStartupFailurePreservesSafeReasonAfterCleanup() }
+    @Test func stopCancelsPendingPickerBeforeWaiting() async throws { try await testStopCancelsPendingPickerBeforeWaiting() }
+    @Test func removedSegmentDisappearsAndRejectsLateJobs() async throws { try await testRemovedSegmentDisappearsAndRejectsLateJobs() }
     @Test func stopInvalidatesBeforeCancellation() async throws { try await testStopInvalidatesBeforeCancellation() }
     @Test func repeatedStopReleasesOnce() async throws { try await testRepeatedStopReleasesOnce() }
     @Test func oldSessionCallbacksCannotAffectRestart() async throws { try await testOldSessionCallbacksCannotAffectRestart() }

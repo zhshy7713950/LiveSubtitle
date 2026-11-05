@@ -147,6 +147,7 @@ actor SessionCoordinator: SessionCoordinating {
         let task = Task { await self.performStart(generation: generation, config: config) }
         startupTask = task
         await task.value
+        guard startupGeneration == generation else { return }
         startupTask = nil
 
         guard let outcome = startOutcome, stopTask == nil, startupGeneration == generation else { return }
@@ -166,7 +167,7 @@ actor SessionCoordinator: SessionCoordinating {
                 phase = .failed
                 publishStatus()
             } else {
-                await stop(reason: .componentFailure)
+                await beginStop(reason: .componentFailure, failure: code)?.value
             }
         }
     }
@@ -426,7 +427,12 @@ actor SessionCoordinator: SessionCoordinating {
             case .remove(let segmentID):
                 retainedRevisions.removeValue(forKey: segmentID)
                 retainedOrder.removeAll { $0 == segmentID }
+                pendingSegments.removeAll { $0.segmentID == segmentID }
+                await dependencies.captions.remove(segmentID: segmentID)
+                guard isValid(identity, scope: .speech) else { return }
                 await dependencies.scheduler.retainOnly(segmentIDs: Set(retainedOrder))
+                guard isValid(identity, scope: .speech) else { return }
+                await refreshCaptions()
             case .discontinuity:
                 continue
             }
@@ -470,7 +476,8 @@ actor SessionCoordinator: SessionCoordinating {
     private func receiveTranslation(job: TranslationJob, update: TranslationUpdate, eventIdentity: SessionIdentity) async {
         guard isValid(eventIdentity, scope: .speech), isCurrent(job.identity), isCurrent(update.identity),
               job.jobID == update.jobID, job.segmentID == update.segmentID,
-              job.sourceRevision == update.sourceRevision else { return }
+              job.sourceRevision == update.sourceRevision,
+              retainedRevisions[job.segmentID] == job.sourceRevision else { return }
         await dependencies.captions.apply(update, for: job, now: dependencies.clock.now())
         guard isCurrent(job.identity) else { return }
         await refreshCaptions()
@@ -484,13 +491,15 @@ actor SessionCoordinator: SessionCoordinating {
     }
 
     private func receiveSchedulerFailure(job: TranslationJob, reason: FailureCode, eventIdentity: SessionIdentity) async {
-        guard isValid(eventIdentity, scope: .speech), isCurrent(job.identity) else { return }
+        guard isValid(eventIdentity, scope: .speech), isCurrent(job.identity),
+              retainedRevisions[job.segmentID] == job.sourceRevision else { return }
         let mode = effectiveMode
         guard let snapshot = await dependencies.captions.snapshot(
             mode: mode,
             status: mode == .localFallback ? .localFallback : .listening
         ) else { return }
         guard isValid(eventIdentity, scope: .speech), isCurrent(job.identity),
+              retainedRevisions[job.segmentID] == job.sourceRevision,
               snapshot.segments.contains(where: {
                   $0.segmentID == job.segmentID && $0.sourceRevision == job.sourceRevision
               }) else { return }
@@ -667,7 +676,9 @@ actor SessionCoordinator: SessionCoordinating {
     }
 
     private func performStop(sessionID: UUID?) async {
+        startupTask?.cancel()
         await startupTask?.value
+        startupTask = nil
         await dependencies.mainActor.cancelPreparation()
         let tasks = Array(consumerTasks.values)
         tasks.forEach { $0.cancel() }

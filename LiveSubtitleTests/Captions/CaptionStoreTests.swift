@@ -224,7 +224,31 @@ private func checkFailureUpdatesRetainedSegment() async throws {
     }
 }
 
+private func checkRemovalRejectsLateUpdates() async throws {
+    let store = CaptionStore()
+    let identity = task06Identity()
+    let removed = task06Segment(range: task06Range(0, 1_000))
+    let retained = task06Segment(range: task06Range(1_000, 2_000), text: "retained")
+    await store.begin(identity: identity, display: .init(displayCount: 3, displayStyle: .bilingual))
+    await store.upsert(removed)
+    await store.upsert(retained)
+    await store.remove(segmentID: removed.segmentID)
+    await store.remove(segmentID: UUID())
+    let job = task06Job(identity: identity, segmentID: removed.segmentID)
+    for failure in [nil, FailureCode.localTranslationFailed] {
+        await store.apply(task06Update(jobID: job.jobID, identity: identity, segmentID: removed.segmentID,
+                                       failure: failure), for: job, now: task06Instant(1))
+    }
+    let snapshot = try await task06Value(store.snapshot(mode: .local, status: .listening))
+    try task06Require(snapshot.segments.map(\.segmentID) == [retained.segmentID],
+                      "removed rows reappeared after late successful/failed translation")
+    if case .pending = snapshot.segments[0].translationState {} else {
+        throw Task06CheckFailure(message: "removal modified another retained row")
+    }
+}
+
 func runCaptionStoreChecks() async throws {
+    try await checkRemovalRejectsLateUpdates()
     try await checkRejectStaleUpdates()
     try await checkSnapshotOrderAndDisplayChange()
     try await checkRevisionMarksPreviousTranslationUpdating()
@@ -236,6 +260,7 @@ func runCaptionStoreChecks() async throws {
 
 #if !TASK06_HOST_CHECK
 struct CaptionStoreTests {
+    @Test func testRemovalRejectsLateUpdates() async throws { try await checkRemovalRejectsLateUpdates() }
     @Test func testRejectStaleUpdates() async throws { try await checkRejectStaleUpdates() }
     @Test func testSnapshotOrderAndDisplayChange() async throws { try await checkSnapshotOrderAndDisplayChange() }
     @Test func testRevisionMarksPreviousTranslationUpdating() async throws { try await checkRevisionMarksPreviousTranslationUpdating() }

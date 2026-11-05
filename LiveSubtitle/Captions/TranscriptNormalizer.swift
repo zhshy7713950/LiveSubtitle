@@ -23,6 +23,9 @@ func captionRange(start: AudioTimestamp, end: AudioTimestamp) -> AudioRange {
 struct TranscriptNormalizer {
     private(set) var events: [TranscriptEvent] = []
     private var checkpoints: [UUID: AudioTimestamp] = [:]
+    // Compacts retired per-utterance checkpoints without forgetting consumed audio.
+    // New events crossing this boundary still require real character/audio mapping.
+    private var retiredThrough: AudioTimestamp?
     private(set) var requiresDiscontinuity = false
     var checkpointCount: Int { checkpoints.count }
 
@@ -43,7 +46,8 @@ struct TranscriptNormalizer {
         var retained: [TranscriptEvent] = []
         for event in events {
             guard let windowed = clipToWindow(event, cutoff: cutoff) else { continue }
-            if let clipped = clip(windowed, checkpoint: checkpoints[event.utteranceID]) {
+            let checkpoint = latestCheckpoint(checkpoints[event.utteranceID], retiredThrough)
+            if let clipped = clip(windowed, checkpoint: checkpoint) {
                 retained.append(clipped)
             }
         }
@@ -62,11 +66,10 @@ struct TranscriptNormalizer {
         if let existing = checkpoints[utteranceID], captionCompare(existing, checkpoint) != .ascending {
             return
         }
-        if checkpoints[utteranceID] == nil && checkpoints.count >= RuntimePolicy.retainedSegmentLimit {
-            requiresDiscontinuity = true
-            events.removeAll()
-            checkpoints.removeAll()
-            return
+        if checkpoints[utteranceID] == nil && checkpoints.count >= RuntimePolicy.retainedSegmentLimit,
+           let oldest = checkpoints.min(by: { captionCompare($0.value, $1.value) == .ascending }) {
+            retiredThrough = latestCheckpoint(retiredThrough, oldest.value)
+            checkpoints.removeValue(forKey: oldest.key)
         }
         checkpoints[utteranceID] = checkpoint
         guard let index = events.firstIndex(where: { $0.utteranceID == utteranceID }) else { return }
@@ -85,6 +88,7 @@ struct TranscriptNormalizer {
     mutating func reset() {
         events.removeAll()
         checkpoints.removeAll()
+        retiredThrough = nil
         requiresDiscontinuity = false
     }
 
@@ -117,10 +121,16 @@ struct TranscriptNormalizer {
         return clipCharacters(event, range: consumed..<event.text.count)
     }
 
+    private func latestCheckpoint(_ lhs: AudioTimestamp?, _ rhs: AudioTimestamp?) -> AudioTimestamp? {
+        guard let lhs else { return rhs }
+        guard let rhs else { return lhs }
+        return captionCompare(lhs, rhs) == .ascending ? rhs : lhs
+    }
+
     private mutating func clip(_ event: TranscriptEvent, checkpoint: AudioTimestamp?) -> TranscriptEvent? {
         guard let checkpoint else { return event }
-        if captionCompare(event.audioRange.start, checkpoint) != .ascending { return event }
         if captionCompare(event.audioRange.end, checkpoint) != .descending { return nil }
+        if captionCompare(event.audioRange.start, checkpoint) != .ascending { return event }
         let consumed = event.spans.filter {
             $0.characterRange.upperBound <= event.text.count &&
             captionCompare($0.audioRange.end, checkpoint) != .descending
