@@ -17,6 +17,7 @@ struct CloudStubResponse: Sendable {
     var chunks: [Data] = []
     var redirectTo: URL?
     var gate: DispatchSemaphore?
+    var staysOpen = false
 
     static func sse(_ text: String, splitBytes: Bool = false) -> CloudStubResponse {
         let data = Data(text.utf8)
@@ -123,7 +124,9 @@ final class CloudURLProtocol: URLProtocol, @unchecked Sendable {
             guard !instance.workState.withLock({ $0.cancelled }) else { return }
             instance.client?.urlProtocol(instance, didLoad: chunk)
         }
-        instance.client?.urlProtocolDidFinishLoading(instance)
+        if !script.staysOpen {
+            instance.client?.urlProtocolDidFinishLoading(instance)
+        }
     }
 
     private static func readBody(_ stream: InputStream?) -> Data? {

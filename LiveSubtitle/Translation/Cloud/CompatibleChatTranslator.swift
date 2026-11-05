@@ -179,7 +179,9 @@ actor CompatibleChatTranslator: Translator {
                 throw TransportError.invalidOutput
             }
             buffer.append(byte)
-            if buffer.count == 4_096 {
+            // Feed completed lines immediately so an event never waits for EOF or 4 KiB.
+            // Keep bounded chunks for long lines; the decoder owns UTF-8 and CRLF state.
+            if byte == 0x0A || byte == 0x0D || buffer.count == 4_096 {
                 consumption = try consume(
                     buffer, decoder: &decoder, consumption: consumption,
                     job: job, continuation: continuation, clock: clock, lastEmission: &lastEmission

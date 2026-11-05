@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 #if !TASK08_HOST_CHECK
 import Testing
 @testable import LiveSubtitle
@@ -385,6 +386,36 @@ private func checkProvisionalThrottle() async throws {
     try cloudRequire(updates.last?.isFinal == true, "throttling dropped final completion")
 }
 
+// A complete event must reach the consumer even below 4 KiB while HTTP remains open.
+private func checkCompleteSSEEventBeforeResponseEnds() async throws {
+    CloudURLProtocol.reset()
+    var response = CloudStubResponse.sse(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"你👩🏽‍💻\"}}]}\r\n\r\n",
+        splitBytes: true
+    )
+    response.staysOpen = true
+    let openResponse = response
+    CloudURLProtocol.setHandler { _ in openResponse }
+    let profile = cloudProfile()
+    let credentials = CloudCredentialStoreStub(keys: [profile.id: "synthetic-test-credential"])
+    let translator = CompatibleChatTranslator(credentials: credentials, configuration: cloudConfiguration())
+    let received = Mutex<[TranslationUpdate]>([])
+    let stream = await translator.translate(cloudJob(profile: profile))
+    let consumer = Task {
+        for await update in stream { received.withLock { $0.append(update) } }
+    }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+    while ContinuousClock.now < deadline && received.withLock({ $0.isEmpty }) {
+        await Task.yield()
+    }
+    let first = received.withLock { $0.first }
+    await translator.cancelAll()
+    await consumer.value
+    try cloudRequire(first?.text == "你👩🏽‍💻", "complete SSE event was buffered until EOF or 4 KiB")
+    try cloudRequire(first?.isFinal == false, "open SSE event was incorrectly finalized")
+    try cloudRequire(received.withLock { $0.allSatisfy { $0.failure == nil } }, "cancelling open SSE fabricated failure")
+}
+
 private func checkConnectionProbeIsFixedText() async throws {
     CloudURLProtocol.reset()
     CloudURLProtocol.setHandler { _ in .sse(
@@ -453,9 +484,10 @@ private struct CompatibleChatTranslatorHostChecks {
         try await checkCancellationDropsLateResults()
         try await checkCancelWhileReadingCredential()
         try await checkProvisionalThrottle()
+        try await checkCompleteSSEEventBeforeResponseEnds()
         try await checkConnectionProbeIsFixedText()
         try await checkConnectionProbeCancellation()
-        print("12 translator and connection host checks passed")
+        print("13 translator and connection host checks passed")
     }
 }
 #else
@@ -473,6 +505,9 @@ struct CompatibleChatTranslatorTests {
     @Test func testCancellationDropsLateResults() async throws { try await checkCancellationDropsLateResults() }
     @Test func testCancelWhileReadingCredential() async throws { try await checkCancelWhileReadingCredential() }
     @Test func testProvisionalThrottle() async throws { try await checkProvisionalThrottle() }
+    @Test func testCompleteSSEEventBeforeResponseEnds() async throws {
+        try await checkCompleteSSEEventBeforeResponseEnds()
+    }
     @Test func testConnectionProbeIsFixedText() async throws { try await checkConnectionProbeIsFixedText() }
     @Test func testConnectionProbeCancellation() async throws { try await checkConnectionProbeCancellation() }
 }
