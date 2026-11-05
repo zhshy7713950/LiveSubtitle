@@ -3,9 +3,9 @@
 - 基线 commit：`a1c57879efbcb734ad5c3560385db72f15b6b7b3`（fetch 后的 `origin/main`，TASK-13 已合入）。
 - 任务分支 / commit：`codex/task-14-validation` / 本交接所属提交。
 - 前置报告：[TASK-13](TASK-13.md)、[G0](../../reports/g0-device-report.md)。G0 仍未完成，不转写为通过。
-- 状态：**未完成（验收有失败和阻塞）；本次测试及报告交付待审查**。按用户选择暂不授权全屏共享，已取消系统选择器；不继续真实 Chrome 播放。
+- 状态：**未完成（验收有失败和阻塞）；本次测试及报告交付待审查**。2026-11-05 用户已配合授权，最小采音通过，正式入口被 PiP 启动失败阻断；详情见续验记录。
 
-## 执行计划与结果
+## 2026-11-04 执行计划与结果
 
 依据 TASK-14 和正式方案 §§15–16.1 执行，不修改生产业务目录或新增产品设计。
 
@@ -29,7 +29,7 @@
 
 没有新增生产类型、公共协议遵守者或装配入口；无需 TASK-13 接入新的生产 constructor。
 
-- `@MainActor AcceptanceRig(response: AcceptanceHTTP.Response = .json, mode: RequestedMode = .ai)`；`start() async throws`、`emit(_:at:stream:) async`、`waitForTranslation(_:) async throws`、`cleanup() async`。
+- `@MainActor AcceptanceRig(response: AcceptanceHTTP.Response = .json, mode: RequestedMode = .ai, pip: (any PiPControlling)? = nil)`；`start() async throws`、`emit(_:at:stream:) async`、`waitForTranslation(_:) async throws`、`cleanup() async`。
 - `AcceptanceHTTP: URLProtocol`，`Response.sse(seed:staysOpen:padding:)` 产生固定字节分块。SDK 的 URLProtocol 要求重述继承的 `@unchecked Sendable`；所有自有共享状态均在 Mutex 中，不传媒体对象，不规避媒体所有权规则。
 - `AcceptanceLocalSession(calls: AcceptanceLocalCalls): LocalTranslationSession`；只在测试中返回固定文本，计数器不保留正文。
 - 复用现有 `Task10Clock`、Integration 和 Session 的测试边界工具；不修改公共 Support、其他 owner 测试或参数。
@@ -42,7 +42,7 @@
 
 网络和文本都是合成夹具，未读取/使用用户 AI Key，未调用付费服务，未录制屏幕/音频或保存真实字幕。只读取得设备/Chrome 版本；设备标识、签名参数和本机长日志不进提交。
 
-## 验证
+## 2026-11-04 验证
 
 环境：2026-11-04，Xcode 27.2（27B52）、SDK 27.2、Swift 6；iPhone 17 Pro / iOS 27.2（24B119），Chrome 156.8078.54，App 0.1.0（1）。没有 simulator runtime 或有效 simulator UDID。
 
@@ -88,8 +88,44 @@ xcodebuild -project LiveSubtitle.xcodeproj -scheme LiveSubtitle -configuration D
 
 ## 未验证与已知问题
 
-- G0 未完成；Chrome MP4/HLS/嵌入/直播、切站、路由、真实 Speech / Translation、PiP 关闭恢复替换、锁屏/来电及三十分钟未测。本次用户明确不授权全屏共享，保持 blocked。
+- G0 未完成；Chrome MP4/HLS/嵌入/直播、切站、路由、真实 Speech / Translation、PiP 关闭恢复替换、锁屏/来电及三十分钟未测。初轮用户不授权；2026-11-05 已授权，但 R06 阻断完整链路。
 - 真实延迟、RSS/队列曲线、热状态、100 段双语质量没有有效样本；无真实 AI 服务性能结论。
 - TASK-13 已记录的启动选择器等待中停止、真实 PiP completion 时机等仍待原 owner 处理，不能以本次运行中停止回归覆盖。
-- 三处普通失败回归未跳过、未标 expected-failure；TASK-14 和 TASK-15 内测门槛未通过。分支应作为缺陷证据审查，不能据此发布“验收完成”。
+- 当前四项普通失败回归（初轮三项及本轮 R07）未跳过、未标 expected-failure；TASK-14 和 TASK-15 内测门槛未通过。分支应作为缺陷证据审查，不能据此发布“验收完成”。
 - 独立分支/worktree保留供审查；按项目要求未推送、未合并，未修改原目录未提交文件。
+
+## 2026-11-05 续验交接
+
+- 本轮起点：cb12919；fetch 后 origin/main 仍为 a1c5787。真机与系统/Chrome 版本未变；没有合并其他分支。
+- 用户选择公开 Apple WWDC25 Platforms State of the Union，并实际配合系统授权。最小采音通过；正式 App 采集启动返回成功后，在 startPiP 同步抛 pipFailed，随后 componentFailure 停止。安全阶段/枚举断点多次复现同一顺序；已删除全部断点并成功 detach，诊断会话与共享页已退出。
+- 当前 A01–A24：3 pass、4 fail、17 blocked；A03 由未授权 blocked 改为有真实失败证据的 fail。Chrome 播放、100 段延迟/质量、三十分钟仍无有效数据，不能把采音测试的等待授权时间计为播放或性能。
+
+### 新增改动
+
+- AcceptanceRig 仅增加可选 PiP 测试边界注入，默认仍使用原来的 FakePiPControlling，既有调用不变。
+- AcceptanceStartupTests.testA03StartupFailureRemainsVisibleAfterCleanup 使用真实会话及字幕/调度模块，在 PiP 边界明确抛 pipFailed；验证清理后应保留 failed 和安全故障原因，同时 identity/source/renderer 必须清空。当前实际为 idle/nil，普通断言稳定失败，未设 expected-failure。
+- 两份报告追加当日设备与测试事实，并保留 2026-11-04 的历史失败/复核记录；没有覆盖失败或修改生产目录。
+
+### 本轮验证
+
+| 命令或设备步骤 | 环境 / 用例数 | 结果 | 限制 |
+| --- | --- | --- | --- |
+| 真机验收套件，acceptance-20261105.xcresult | 9 方法 / 2 suites | 6 通过、3 失败、0 跳过；退出 65 | R01–R03 未修复 |
+| 现有 TASK04_INTERACTIVE 最小采音 | 1 方法 / 1 suite | 1/1 实际通过、0 跳过；退出 0 | 收到有效非空自有 PCM，stop 后流结束；不等于非静音 Chrome / Speech / Translation / PiP |
+| 正式入口与安全枚举诊断 | 用户手选 en_US → zh-Hans-CN，本地模式 | 选择回调、采集成功返回，继而 pipFailed / componentFailure | R06；两个 PiP 可用性布尔值及首帧状态尚未分别测量，不能宣称硬件不支持 |
+| R07 新回归，startup-failure-20261105.xcresult | 1 方法 | 2 条错误保留断言失败，清理断言通过；退出 65 | 未越界修复 Session |
+| 本轮完整真机，full-acceptance-20261105.xcresult | 202 方法 / 30 suites | 197 通过、5 失败，0 跳过、0 expected failure；退出 65 | R01/R02/R03/R07 加既有 R05，合计 6 条断言问题；未重跑以掩盖波动 |
+| Activity Monitor 资源预检 | App 名称/PID 附加 | 未获得有效 trace | 不作为内存/CPU 超限结论 |
+| 最终 scripts/verify.sh、check_docs.py、git diff --check | Debug / Release / generic simulator App 和测试 bundle；文档及差异 | 退出 0 / 检查通过 | 仅编译，不抵消行为测试失败 |
+
+最小采音测试只通过命令行 SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG TASK04_INTERACTIVE 打开已有交互测试；没有编辑 TASK-04 测试、工程或 Config。完整真机随后恢复正常 Debug 条件，不包含该交互测试；本轮无有效 simulator runtime，未执行模拟器行为测试。原始结果和诊断仅在忽略的 build/ 或临时目录，提交不含设备标识、签名参数、正文或媒体。
+
+### 新的 owner 请求
+
+- **R06 → TASK-11 + TASK-13 集成人**：真实采集已启动，PiP start 同步失败。核对 isSupported/isPossible 及 renderer 首帧、挂载、激活和 Session 刷新顺序；对尚未 ready 的情况设计有界等待与取消，新增参数由集成人放入 RuntimePolicy，不能返回假成功绕过系统状态。修复后重新执行本次真实授权步骤，确认 PiP 实际显示，才进入 Chrome 播放。
+- **R07 → TASK-03**：启动失败的安全 FailureCode 必须跨资源清理保留，并使最终状态为 failed；当前已有 identity 时未设置 terminalFailure，stop 的 nil 新故障在 performStop 后覆盖了 pipFailed。运行新增用例，并保留主动取消的正常 ready/无故障语义以及旧代次隔离。
+- **R04**：手动选择后界面可以显示具体语言；默认/异步能力加载时仍出现 tag 提示，保留原 owner 核对，不断言候选列表为空。
+
+本轮未修改生产实现，下一阶段先由相应 owner 修复启动阻断与已知失败，再继续剩余验收。无需用户再改权限设置或重复点击共享。
+
+本轮独立只读审查复核了 R07 的真实 coordinator 清理路径、PiP 注入默认行为及 R06 的证据边界；已修正缺陷表断行和历史/当日记录措辞。未发现新增测试/报告的 Critical 或 Important 问题；生产失败保持未修复并按 owner 请求交接。

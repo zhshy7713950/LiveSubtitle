@@ -16,7 +16,8 @@ struct AcceptanceRig {
     let config: SessionConfig
     var host: String { profile.endpoint.host! }
 
-    init(response: AcceptanceHTTP.Response = .json, mode: RequestedMode = .ai) {
+    init(response: AcceptanceHTTP.Response = .json, mode: RequestedMode = .ai,
+         pip: (any PiPControlling)? = nil) {
         let profile = CloudProfile(id: UUID(), name: "验收固定响应",
             endpoint: URL(string: "https://\(UUID().uuidString).invalid/v1/chat/completions")!,
             model: "acceptance-fixture", revision: 1)
@@ -34,7 +35,7 @@ struct AcceptanceRig {
             capability: IntegrationCapability(blocker: nil), assets: FakeLanguageAssetManaging(),
             audioSource: source, audioProcessing: AudioPipeline(), speech: speech,
             segmenter: CaptionSegmenter(clock: clock), scheduler: scheduler, captions: captions,
-            renderer: renderer, pip: FakePiPControlling(), preferences: FakePreferencesStoring(profiles: [profile]),
+            renderer: renderer, pip: pip ?? FakePiPControlling(), preferences: FakePreferencesStoring(profiles: [profile]),
             connectionTester: CloudConnectionTester(credentials: credentials, configuration: configuration),
             diagnostics: DiagnosticsRecorder(clock: clock), clock: clock))
         self.localCalls = localCalls

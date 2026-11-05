@@ -1,18 +1,18 @@
 # TASK-14 正式验收报告
 
-状态：**未通过，TASK-14 未完成**。记录日期：2026-11-04（Asia/Shanghai）。
+状态：**未通过，TASK-14 未完成**。首次记录：2026-11-04；续验更新：2026-11-05（Asia/Shanghai）。
 
 ## 版本与证据边界
 
 | 项目 | 本轮记录 |
 | --- | --- |
 | 产品基线 | `a1c57879efbcb734ad5c3560385db72f15b6b7b3`，fetch 后的 `origin/main`，包含 TASK-13 |
-| 验收分支 | `codex/task-14-validation`；报告绑定本提交，生产代码与上述基线一致 |
+| 验收分支 | `codex/task-14-validation`；续验起点 `cb12919`，报告绑定本提交；fetch 后 main 未更新，生产代码仍与上述基线一致 |
 | App | 0.1.0（1），正式入口；真机测试使用 Debug 构建 |
 | 工具 | Xcode 27.2（27B52），iPhoneOS / iPhoneSimulator SDK 27.2，Swift 6 完整并发检查 |
 | 设备 | iPhone 17 Pro，iOS 27.2（24B119），物理连接；不提交设备标识 |
 | Chrome | 156.8078.54（设备已安装版本；不等于本轮已完成 Chrome 播放） |
-| 语言对 | 固定回归 en → zh-Hans；正式入口显示两类本地资源均已就绪 |
+| 语言对 | 固定回归 en → zh-Hans；2026-11-05 用户在正式入口手选英语（美国）→简体中文（中国），存储标签为 en_US / zh-Hans-CN；两类资源均显示就绪 |
 | 网络与 AI | 所有新增 AI 回归由 host 隔离的 URLProtocol 固定响应截获；未知请求在该 transport 内失败。无真实 AI endpoint / 模型 / Key，无真实服务性能样本 |
 | 前置 | [TASK-13 交接](../tasks/handoffs/TASK-13.md)已合入；[G0 报告](g0-device-report.md)仍未完成，不能转记为通过 |
 
@@ -24,7 +24,7 @@
 | --- | --- | --- | --- |
 | A01 | 首次资源缺失与取消 | blocked | 正式 UI 本轮可见识别、本地备用翻译两行均为“已就绪”；未重置首次安装环境或删除模型。既有资源 blocker 自动回归通过，未验证首次系统下载及取消 |
 | A02 | 不支持语言／语言对 | blocked | 既有 Capability / Features 自动回归已执行；真实不支持语言的前台提示仍欠操作。源/目标 Picker 的当前值为空，但菜单有候选，见 R04；不能据此宣称未返回任何语言 |
-| A03 | 英文→简中本地 | blocked | 本轮正式 App 已到系统全屏共享确认页；用户明确暂不授权，已取消选择器；尚无 Chrome 声音、真实识别/翻译及持续显示证据。G0 未完成 |
+| A03 | 英文→简中本地 | fail | 2026-11-05 用户已配合授权。实际选择回调及采集启动均成功，随后启动 PiP 抛 pipFailed 并停止会话（R06）；错误清理后回到 idle/nil，新增回归复现 R07。未进入 Chrome 播放，完整本地链路失败；不记作用户拒绝授权 |
 | A04 | 下载后断网本地 | blocked | 固定输入本地路径无字幕网络请求的自动回归通过；尚缺离线可播放非敏感英文素材及断网设备步骤 |
 | A05 | MP4、HLS、嵌入、直播 | blocked | 四类真实素材本轮均未播放；未登记素材版本/时间范围，声音/字幕/延迟均无实测值 |
 | A06 | 切站和切视频 | blocked | 尚无同一真实共享会话跨站证据；不泛化网站覆盖 |
@@ -45,9 +45,9 @@
 | A21 | deadline 及队列压力 | blocked | 并发/总截止/修订预算回归通过；最终全量的既有队列溢出测试出现 R05 波动，不写全部通过；新增首文本超时跨模块通过。真实 Chrome 音频/翻译积压的最大值、持续丢弃记录缺失 |
 | A22 | 停止、重启无历史 | blocked | 新增及既有自动回归验证停止时 renderer/store 清空，重启只有新段；未执行正式设备 App 冷启动后历史/偏好人工检查 |
 | A23 | 日志、缓存与网络内容边界 | blocked | 固定输入本地零请求、诊断无正文/Key/endpoint、请求仅当前段和禁缓存的既有测试通过；尚未对真实 Chrome 全链路做日志/网络/容器核查 |
-| A24 | 连续三十分钟 | blocked | 实际连续播放时长 0 分钟；有效性能样本 0/100，人工双语质量样本 0/100。P95、RSS 曲线、队列曲线及热状态均 N/A，见[性能报告](performance-report.md) |
+| A24 | 连续三十分钟 | blocked | 当前被 R06 启动失败阻断；实际连续播放时长 0 分钟；有效性能样本 0/100，人工双语质量样本 0/100。P95、RSS 曲线、队列曲线及热状态均 N/A，见[性能报告](performance-report.md) |
 
-当前矩阵：pass 3 项（A10–A12），fail 3 项（A09/A13/A14），blocked 18 项，not-run 0 项。这里的 pass 严格限定为相应固定响应/逻辑验收，不构成完整产品通过。
+当前矩阵：pass 3 项（A10–A12），fail 4 项（A03/A09/A13/A14），blocked 17 项，not-run 0 项。这里的 pass 严格限定为相应固定响应/逻辑验收，不构成完整产品通过。
 
 ## 已复现缺陷与责任归属
 
@@ -56,13 +56,27 @@
 | R01 | 高 / TASK-08 Cloud | `AcceptanceCloudTests.testA09CompleteSSEEventsAppearBeforeResponseEnds`；HTTP 留开，三个完整 content 事件总量小于 4096 字节，显示无 AI 文本。相同 UTF-8 内容附 DONE/EOF 的测试通过 | `CompatibleChatTranslator.consumeSSE` 仅在 `buffer.count == 4096` 或流结束时调用 consume；应及时消费完整 SSE 事件并保留事件/响应上限。补开放流/首文本计时回归 |
 | R02 | 高 / 集成人 Contracts + TASK-03 + TASK-06 | `AcceptanceCaptionTests.testA13MergedFinalRemovesSupersededRowsFromDisplay`；输出为最终合并行加第二条旧临时行，期望只有最终行 | `consumeSegments(.remove)` 仅更新 retained 索引和 scheduler，CaptionStoring 无 remove 端口；沿用 TASK-03/13 请求新增 `remove(segmentID:) async`，生产 store 删除并刷新，保证旧作业拒收 |
 | R03 | 高 / TASK-06 Captions | `AcceptanceCaptionTests.testA14CheckpointRolloverDoesNotLoseAnUtterance`；前 10 段可见，第 11 段缺失，第 12 段又可见 | `TranscriptNormalizer.consume` 在新增第 11 个 checkpoint 时要求 discontinuity；`CaptionSegmenter.closeActive` 将本次 upsert 改为 discontinuity，协调器忽略该事件，导致本句丢失。保留有界性同时处理触发上限的有效文字，不能靠增大阈值掩盖 |
-| R04 | 中 / TASK-12 Features | 正式 App 的源/目标行均无当前值；打开源菜单可见语言候选，返回后默认配置仍可进共享选择器；运行日志亦有默认标签未关联 Picker tag 的系统提示 | 核对默认 `en` / `zh-Hans` 与 SDK 返回的带地区 locale 的 tag 匹配和当前值展示；本轮没有修改用户的语言选择，也没有证明所有候选为空 |
+| R04 | 中 / TASK-12 Features | 正式 App 的源/目标行均无当前值；打开源菜单可见语言候选，返回后默认配置仍可进共享选择器；运行日志亦有默认标签未关联 Picker tag 的系统提示 | 2026-11-04 未修改语言选择；2026-11-05 用户手选后可显示具体语言。核对默认/加载阶段的 locale tag 匹配，不把候选列表写成空 |
+| R05 | 中 / TASK-10 测试同步待核对 | 2026-11-04 全量曾失败，独立 6/6 及该日最后全量通过；2026-11-05 全量中 `TranslationSchedulerTests.testQueueOverflowAtDeadline` 又因 fallback 数量失败 | 与 TASK-13 已记录波动一致。源码只等待 failed 被消费便断言随后 fallback 的数量，存在异步消费竞态的解释；尚未证明唯一根因。由 owner 加入 fallback 消费条件，保留当前失败记录，不据此声称生产 timeout 丢失 |
+| R06 | 高 / TASK-11 + TASK-13 集成人 | 真实正式入口重复出现：picker 更新回调 → 采集启动 code=nil → capture 返回 → startPiP → pipFailed → componentFailure 停止；最小真实采音测试 1/1 通过 | PiPCoordinator.start 在新建 system adapter 后立即要求 isSupported && isPossible，renderer.activate 和首个 snapshot 在其后；需协调首帧、可用性等待、取消与装配顺序。当前仅确认同步 PiP 启动失败，未分别测出两个布尔值，不宣称设备不支持 PiP |
+| R07 | 高 / TASK-03 Session | 新增 AcceptanceStartupTests.testA03StartupFailureRemainsVisibleAfterCleanup：PiP 边界抛 pipFailed，清理完成后的 phase 实为 idle、failure 实为 nil；两条断言失败，资源清理断言通过 | startOutcome.failed 在已有 identity 时只写 failure，随后 stop 以 nil 新故障进入清理；performStop 用 terminalFailure 覆盖状态，丢失原因。应在对应启动代次内保留安全故障并呈现 failed；主动取消仍应保持正常取消语义 |
 
-| R05 | 中 / TASK-10 测试同步待核对 | 首轮最终全量的 `TranslationSchedulerTests.testQueueOverflowAtDeadline` 断言 fallback 数量失败；单独复核 6/6 通过，最后全量中该项亦通过 | 与 TASK-13 已记录波动一致。源码只等待 failed 被消费便断言随后 fallback 的数量，存在异步消费竞态的解释；尚未证明唯一根因。由 owner 加入 fallback 消费条件，保留当前失败记录，不据此声称生产 timeout 丢失 |
+R01–R03 保留为正常、未跳过、会失败的回归；不使用 expected-failure 或降低断言隐藏缺陷。TASK-14 不拥有这些生产目录，未修复或修改共享接口。R04 是人工观察，不冒充新增自动回归。TASK-13 已记录的“选择器等待中停止”仍未解决；本轮已把真实 PiP 启动失败收敛为 R06。R07 另有普通失败回归，未设 expected-failure。
 
-R01–R03 保留为正常、未跳过、会失败的回归；不使用 expected-failure 或降低断言隐藏缺陷。TASK-14 不拥有这些生产目录，未修复或修改共享接口。R04 是人工观察，不冒充新增自动回归。TASK-13 已记录的“选择器等待中停止”及真实 PiP 问题也未解决。
+## 2026-11-05 续验
 
-## 执行证据
+- 真实 iPhone、iOS、Chrome 和工具版本与环境表一致；fetch 后 main 仍是 a1c5787，没有擅自合并其他任务分支。
+- 验收套件复测：9 方法 / 2 suites，6 通过、3 失败、0 跳过，退出 65；R01–R03 仍可复现。
+- 以命令行临时编译条件 DEBUG TASK04_INTERACTIVE 打开已有 ScreenCaptureAudioSourceDeviceTests，不修改 TASK-04 测试或工程。真实用户授权后 1/1 实际执行通过，0 跳过，退出 0；收到非空自有 PCM、元数据有效，stop 后流结束。17.321 秒测试时间包含等待授权，不是 Chrome 播放时长、非静音或延迟指标。
+- 正式入口用户手动授权仍停留在共享页。为定位原因，在本 App 的采集/会话源代码处设置自动继续的诊断断点，只观察固定阶段和安全枚举。多次实际回调顺序均为采集成功后同步 pipFailed 并停止，见 R06；没有记录媒体、转写或 Key。调试断点会扰动时序，因此不计入性能样本；结束时删除全部断点并成功脱离调试器。
+- 新增 R07 跨模块回归：1 方法实际执行，2 条状态/故障断言失败，identity/source/renderer 的清理断言通过；退出 65。该用例使用真实 coordinator/pipeline/segmenter/scheduler/store 和明确失败的 PiP double，不弹系统选择器。
+- 最终 `./scripts/verify.sh` 退出 0，Debug、Release、generic simulator App/测试 bundle 均编译成功；文档检查及差异空白检查通过。没有模拟器 runtime，不执行模拟器行为测试。
+- 本轮完整真机回归 full-acceptance-20261105.xcresult：202 方法 / 30 suites，**197 通过、5 失败、0 跳过、0 expected failure，退出 65**；共 6 个断言问题。失败方法为 R01、R02、R03、R07，以及既有 TranslationSchedulerTests.testQueueOverflowAtDeadline 的 R05 波动；不把 6 条断言写成 6 个失败测试。
+- 本轮公开素材登记为 [Apple WWDC25 Platforms State of the Union](https://developer.apple.com/videos/play/wwdc2025/102/)。用户选择该素材，但正式入口未通过，尚未在 Chrome 播放；不能填 MP4/HLS/直播覆盖或 100 段样本。
+- 资源采样预检中 Instruments 可列设备/模板，但按 App 名称及明确 PID 附加 Activity Monitor 均未获得进程，未产生有效资源数据；这不是内存超标证据。停止真实长时验收的主要阻断仍为 R06。
+- iPhone 镜像已连接，键盘可打开 App；本次坐标点按工具返回 noWindowsAvailable。共享选择由用户手动完成，不能把该工具问题写成 iPhone 不支持控制或 App 权限拒绝。诊断会话已结束，系统共享页已退出。
+
+## 2026-11-04 历史执行证据
 
 - 基线 `./scripts/verify.sh`：退出码 0，Debug/Release/generic simulator 测试 bundle 编译通过。
 - 基线真机全量：192 个测试方法、27 suites 全部实际执行通过，0 跳过；`TEST SUCCEEDED`。
@@ -78,6 +92,6 @@ R01–R03 保留为正常、未跳过、会失败的回归；不使用 expected-
 
 ## 真实设备观察与后续关卡
 
-本轮已通过 Device Hub 看到正式设置入口及系统全屏共享确认页；用户已明确“暂不授权，记录为阻塞”，选择器已取消。尚未把共享确认后的采音、识别、翻译、字幕 PiP 或 Chrome 视为通过。首次安装资源场景未重置；没有录制屏幕/音频或保存字幕正文。
+2026-11-04 用户暂不授权，初轮只看到共享确认页。2026-11-05 用户已经配合选择语言和授权；最小真实采音通过，正式 App 因 R06 在 PiP 启动处失败。当前未获得 Chrome 声音、真实连续识别/翻译、PiP 持续刷新或十五分钟 G0 证据。不得继续沿用“用户未授权”作为本轮原因。
 
-集成人先处理 R01–R03 并运行本分支保留的回归，再核对 R04 与生产采样接线，重跑 G0 十五分钟链路。随后登记 MP4/HLS/嵌入/直播的非敏感英文素材、URL 与版本/时间范围、真实语言标签和网络条件；逐项补足 A01–A24、100 段延迟/质量及三十分钟记录。TASK-15 内测门槛仍不满足。
+集成人先协调 R06 的首帧/可用性/装配启动顺序和 R07 的错误保留，并处理 R01–R03，再复跑失败回归及完整真机链路。R05 的异步测试同步、R04 的默认语言标签问题一并归原 owner。随后登记各类素材及实际播放区间，补足 A01–A24、100 段延迟/质量及三十分钟记录；本轮生产代码未修改，TASK-14 和 TASK-15 内测门槛仍未通过。
