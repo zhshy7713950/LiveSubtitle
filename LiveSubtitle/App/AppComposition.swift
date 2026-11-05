@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import UIKit
 
 /// The only production dependency graph. Constructors perform no subtitle requests.
 @MainActor
@@ -22,7 +23,21 @@ final class AppComposition: ObservableObject {
 
     init() {
         let clock = SystemMonotonicClock()
-        let diagnostics = DiagnosticsRecorder(clock: clock)
+        let metricSink: (@Sendable (DiagnosticSample) -> Void)?
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--validation-metrics") {
+            metricSink = { @Sendable (sample: DiagnosticSample) in
+                print("TASK14_METRIC \(sample.line)")
+            }
+        } else {
+            metricSink = nil
+        }
+#else
+        metricSink = nil
+#endif
+        let diagnostics = DiagnosticsRecorder(clock: clock, sink: metricSink)
+        let sampler = RuntimeResourceSampler(diagnostics: diagnostics, clock: clock,
+                                             interval: RuntimePolicy.resourceSamplingInterval)
         let credentials = KeychainCredentialStore()
         let store = PreferencesStore()
         let preferences = FeaturePreferencesCoordinator(store: store)
@@ -34,9 +49,12 @@ final class AppComposition: ObservableObject {
         let connection = CloudConnectionTester(credentials: credentials)
         let scheduler = TranslationScheduler(
             aiTranslator: CompatibleChatTranslator(credentials: credentials, clock: clock),
-            localTranslator: AppleLocalTranslator(), clock: clock)
+            localTranslator: AppleLocalTranslator(), clock: clock, onDiagnostic: { @Sendable event in diagnostics.recordImmediately(event) })
         let session = SessionCoordinator(dependencies: SessionDependencies(
-            capability: capability, assets: assets, audioSource: LifecycleAudioSource(base: ScreenCaptureAudioSource(), scope: captureScope),
+            capability: capability, assets: assets,
+            audioSource: LifecycleAudioSource(base: ScreenCaptureAudioSource(), scope: captureScope,
+                                             sampler: sampler, playbackSession: PlaybackAudioSession(), clock: clock,
+                                             foregroundIsActive: { UIApplication.shared.applicationState == .active }),
             audioProcessing: AudioPipeline(), speech: SpeechService(),
             segmenter: CaptionSegmenter(clock: clock), scheduler: scheduler, captions: CaptionStore(),
             renderer: renderer, pip: pip, preferences: store, connectionTester: connection,

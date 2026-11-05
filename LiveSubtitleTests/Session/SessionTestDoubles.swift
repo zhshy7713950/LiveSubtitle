@@ -201,6 +201,7 @@ actor FakeTranslationScheduling: TranslationScheduling {
     private(set) var modeCalls: [SchedulerModeCall] = []
     private(set) var submittedSegments: [CaptionSegment] = []
     private(set) var retainedIDs: [Set<UUID>] = []
+    private(set) var discardedFailures: [TranslationJob] = []
     private(set) var stopCount = 0
     private var setModeContinuation: CheckedContinuation<Void, Never>?
     private var stopContinuation: CheckedContinuation<Void, Never>?
@@ -216,6 +217,7 @@ actor FakeTranslationScheduling: TranslationScheduling {
 
     func submit(_ segment: CaptionSegment) async { submittedSegments.append(segment) }
     func retainOnly(segmentIDs: Set<UUID>) async { retainedIDs.append(segmentIDs) }
+    func discardFailure(for job: TranslationJob) async { discardedFailures.append(job) }
 
     func setMode(_ mode: EffectiveMode, identity: SessionIdentity, config: SessionConfig, profile: CloudProfile?) async throws {
         modeCalls.append(SchedulerModeCall(mode: mode, identity: identity, profile: profile))
@@ -306,6 +308,7 @@ actor FakeCaptionStoring: CaptionStoring {
 
     func snapshot(mode: EffectiveMode, status: SubtitleStatus) async -> SubtitleSnapshot? {
         if shouldSuspendSnapshot {
+            shouldSuspendSnapshot = false
             await withCheckedContinuation { continuation in
                 snapshotContinuation = continuation
             }
@@ -339,6 +342,7 @@ actor FakeCaptionStoring: CaptionStoring {
         upsertContinuation?.resume()
         upsertContinuation = nil
     }
+    var snapshotWaiting: Bool { snapshotContinuation != nil }
     func suspendSnapshot() { shouldSuspendSnapshot = true }
     func releaseSnapshot() {
         shouldSuspendSnapshot = false

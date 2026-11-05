@@ -129,3 +129,53 @@ xcodebuild -project LiveSubtitle.xcodeproj -scheme LiveSubtitle -configuration D
 本轮未修改生产实现，下一阶段先由相应 owner 修复启动阻断与已知失败，再继续剩余验收。无需用户再改权限设置或重复点击共享。
 
 本轮独立只读审查复核了 R07 的真实 coordinator 清理路径、PiP 注入默认行为及 R06 的证据边界；已修正缺陷表断行和历史/当日记录措辞。未发现新增测试/报告的 Critical 或 Important 问题；生产失败保持未修复并按 owner 请求交接。
+
+## 2026-11-05 授权集成续修（当前）
+
+用户在原“开发 task14”明确授权“授权集成修复并继续验收”，本轮续做同一任务，允许承担集成人职责修改必要生产模块和公共契约。未扩大产品范围，未推送/合并，未触碰原 main 未提交文件。早期“生产未修改/尚未修复”仅保留历史证据，以本节为准。
+
+续修起点 fab0af2；前序修复 a93ce82（首帧/等待）、8b4faa9（SSE）、440641f（语言标签/同步）、795c829（错误保留/字幕修订）、34cdde7/fab0af2（诊断）已在分支。
+
+### 改动与接口
+
+- 新必需方法 TranslationScheduling.discardFailure(for:) async。协调器对 failed(job:) 在 snapshot 等待前后校验完整 identity/保留段/revision，fallbackRequested 只作提示。Scheduler 有界 pendingFailures 只退休故障项、暂停新派发，保留其他任务及原 deadline，每个有效 deadline 单独发故障。确认严格匹配 identity/jobID/segmentID/revision，不重置 AI 预算、不解除其他故障，修订/淘汰/换代/停止同步清理。
+- PiP readiness 先查取消/截止，再接受 possible，拒绝 late-ready。采集成功后内部 CancellationError 必须清理组件，不能冒充选择器取消。Setup 停止/取消/换语言/模式先 stop 再等待 preparation。
+- PlaybackAudioSession: PlaybackAudioSessionManaging 配置 playback/moviePlayback/mixWithOthers，无播放器/麦克风/静音。LifecycleAudioSource.init(base:scope:sampler:playbackSession:clock:foregroundIsActive:mayStart:) 按 session 所有者释放，新可选参数兼容旧调用。
+- 真实采集完成时共享系统面板可能仍显示（inactive），此时 PiP 得到 AVKit -1001。正式入口现保留 requestingCapture 等用户返回 active 再启动 Speech/PiP，停止/取消可中断并回收底层。RuntimePolicy.captureForegroundPollInterval=50ms，PiP 三秒 readiness 在返回前台后开始。
+- DiagnosticsRecorder.recordImmediately nonisolated 同步写 Mutex 有界环，队列/RSS/热状态共用运行 UUID，clear 后旋转。resourceSamplingInterval=1s，stop 取消 sampler。仅 Debug --validation-metrics 输出数值/封闭枚举；Release 无出口。PiP 错误仅 domain 分类/code，无正文。
+- PiPDeviceProbeTests 仅 TASK14_PIP_DEVICE 开启，可加 TASK14_CAPTURE_DEVICE；独立窗口内存帧、真实 PiP/可选采集，结束清理窗口/PiP/采集/音频，不启用 Speech/Translation/网络，不录媒体，不在正常全量执行。
+
+### 验证
+
+| 本机结果包 / 命令 | 结果 | 边界 |
+| --- | --- | --- |
+| resume-review-red.xcresult | 12方法/3 suites，7条问题 | late-ready、内部取消、旧故障/修订RED |
+| resume-review-green2.xcresult | 59方法/7 suites通过 | 故障确认/deadline/预算/指标 |
+| resume-ui-red2.xcresult | 8方法，4参数场景失败 | 临时旧Setup的停止/取消/换语言/模式失败；finally恢复修复实现 |
+| resume-full2.xcresult | 232方法/33 suites通过，展开248实例 | 正常Debug真机，0失败/跳过/expected failure |
+| pip-without-capture.xcresult | 1/1通过 | 无采集真实PiP started |
+| pip-with-capture2.xcresult | 1方法失败，2条问题 | inactive时PiP失败 |
+| pip-with-capture-active.xcresult | 1方法失败 | 用户未关面板前耗尽三秒readiness |
+| pip-with-capture-dismissed.xcresult | 1/1通过 | 返回active后真实采集+PiP，测试随后收尾退出 |
+| foreground-full2.xcresult | **234方法通过，展开251实例，0失败/跳过，退出0** | 前台等待/停止/取消回归，探针条件关闭 |
+| ./scripts/verify.sh | **退出0** | 文档/设备Debug/Release/generic simulator App和测试bundle编译 |
+| simulator行为 | 未执行 | 无runtime/有效UDID |
+
+全量仍有既有 G0SpeechInputTests 主线程音频会话提示，不宣称零警告。中间夹具参数/Sendable编译错误已修正，不算行为RED。原始日志/结果包只在忽略build或本机临时目录，提交无设备标识/签名/正文/媒体。
+
+### 未完成
+
+R01–R05/R07已修复，R04默认语言前台待复核；R06已定位inactive时序且最小真实采集+PiP通过，正式App持续显示/识别/翻译待本轮核验。G0、A01–A24、100段延迟/双语质量、30分钟曲线、真实AI性能未完成。RSS/热状态/队列已接线；capture→Speech/原文和译文首次实际可见、CPU、音频积压指标未齐，不以短采样/测试耗时替代。
+
+契约已在本分支同步集成，无待其他owner代改请求；合入审查须同时检查Contracts、全部conformer和coordinator/scheduler确认路径。保持未完成，不把自动测试/探针写成产品验收。
+
+
+## 2026-11-05 收工与下次入口
+
+用户确认正式 App “持续显示小窗，并出现译文和原文”，并明确要求提交远程、明天继续验收。本轮停止扩大验收范围，任务保持未完成；原 R06 正式启动阻断已解除。运行状态约 116.75 秒，非精确视频播放时间；资源短样本及边界见性能报告。
+
+最终提交前移除 PiP adapter 全局 active 限制，保留初次共享面板等待于 LifecycleAudioSource，避免背景恢复被同一门槛阻断；该清理仅获自动回归/编译证据，明天先复测初次启动与 A17。final-20261105.xcresult：234 方法总数，232 通过、2 G0 installed-resource 条件跳过、0 失败；展开 249 通过/2 跳过，退出0。系统 lowLatency readiness 为 false，未下载或降低条件。最终 verify 退出0；此前 foreground-full2 的234方法/251实例全通过保留为阶段证据。两次差异是设备资源前置变化，不能将最终结果写成零跳过。
+
+明天按顺序：确认语言资源 readiness；重复共享→关闭系统面板→双语 PiP→Chrome声音/无重复；A17恢复与关闭；G0十五分钟；补余下矩阵、100段延迟/双语质量与30分钟。真实AI性能仍未测；不要把固定响应当真实服务。没有新增定时任务。
+
+提交包含必要生产集成修复、回归、显式可选设备探针及报告；远程目标 origin/codex/task-14-validation。保持 main 不变，不合并其他分支。提交哈希由该分支 Git 记录绑定（本报告与实现同次提交），原始结果包/日志仅在忽略目录。

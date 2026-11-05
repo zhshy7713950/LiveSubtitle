@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 struct DiagnosticSample: Sendable {
     let sessionID: UUID
@@ -35,20 +36,38 @@ struct DiagnosticSample: Sendable {
 /// Ephemeral local memory only; there is no persistence, upload, or automatic export.
 actor DiagnosticsRecorder: DiagnosticsRecording {
     private let clock: any MonotonicClock
-    private var sessionID = UUID()
-    private var samples: [DiagnosticSample] = []
+    private let sink: (@Sendable (DiagnosticSample) -> Void)?
+    private struct State {
+        var sessionID = UUID()
+        var samples: [DiagnosticSample] = []
+    }
+    private let state = Mutex(State())
 
-    init(clock: any MonotonicClock = SystemMonotonicClock()) { self.clock = clock }
-
-    func record(_ event: DiagnosticEvent) async {
-        if samples.count == RuntimePolicy.diagnosticEventLimit { samples.removeFirst() }
-        samples.append(DiagnosticSample(sessionID: sessionID, instant: clock.now(), event: event))
+    init(clock: any MonotonicClock = SystemMonotonicClock(),
+         sink: (@Sendable (DiagnosticSample) -> Void)? = nil) {
+        self.clock = clock
+        self.sink = sink
     }
 
-    func snapshot() -> [DiagnosticSample] { samples }
+    func record(_ event: DiagnosticEvent) async { recordImmediately(event) }
+
+    /// Scheduler metrics share the same bounded ring and per-run ID without delivery tasks.
+    nonisolated func recordImmediately(_ event: DiagnosticEvent) {
+        let sample = state.withLock { state in
+            if state.samples.count == RuntimePolicy.diagnosticEventLimit { state.samples.removeFirst() }
+            let sample = DiagnosticSample(sessionID: state.sessionID, instant: clock.now(), event: event)
+            state.samples.append(sample)
+            return sample
+        }
+        sink?(sample)
+    }
+
+    func snapshot() -> [DiagnosticSample] { state.withLock { $0.samples } }
 
     func clearSession() async {
-        samples.removeAll(keepingCapacity: false)
-        sessionID = UUID()
+        state.withLock {
+            $0.samples.removeAll(keepingCapacity: false)
+            $0.sessionID = UUID()
+        }
     }
 }

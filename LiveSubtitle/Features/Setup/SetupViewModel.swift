@@ -145,6 +145,7 @@ final class SetupViewModel: ObservableObject {
             if let task = preparationTask {
                 task.cancel()
                 assets.cancelPreparation()
+                await session.stop(reason: .user)
                 await task.value
                 await assets.releaseReservations()
                 preparationTask = nil
@@ -207,7 +208,8 @@ final class SetupViewModel: ObservableObject {
         task.cancel()
         assets.cancelPreparation()
         message = "正在取消准备"
-        Task { @MainActor [weak self, assets] in
+        Task { @MainActor [weak self, assets, session] in
+            await session.stop(reason: .user)
             await task.value
             await assets.releaseReservations()
             self?.isPreparing = false
@@ -221,13 +223,14 @@ final class SetupViewModel: ObservableObject {
             configurationGeneration &+= 1
             task.cancel()
             assets.cancelPreparation()
+            await session.stop(reason: .user)
             await task.value
             await assets.releaseReservations()
             preparationTask = nil
             isPreparing = false
         }
-        await session.stop(reason: .user)
         if !hadPreparation {
+            await session.stop(reason: .user)
             await assets.releaseReservations()
         }
     }
@@ -305,14 +308,16 @@ final class SetupViewModel: ObservableObject {
 
     private func languageSelectionChanged() async {
         configurationGeneration &+= 1
+        let hadPreparation = preparationTask != nil
         if let task = preparationTask {
             task.cancel()
             assets.cancelPreparation()
+            await session.stop(reason: .languageChanged)
             await task.value
             preparationTask = nil
             isPreparing = false
         }
-        await session.stop(reason: .languageChanged)
+        if !hadPreparation { await session.stop(reason: .languageChanged) }
         await assets.releaseReservations()
         await persistPreferences()
         await reloadCapabilities()

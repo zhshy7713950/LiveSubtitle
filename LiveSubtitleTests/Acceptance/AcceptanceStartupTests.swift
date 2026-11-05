@@ -30,3 +30,23 @@ struct AcceptanceStartupTests {
         await rig.cleanup()
     }
 }
+
+@MainActor
+private final class AcceptanceCancelledPiP: PiPControlling {
+    func start(sessionID: UUID) async throws -> AsyncStream<PiPEvent> { throw CancellationError() }
+    func stop(sessionID: UUID) async {}
+}
+
+extension AcceptanceStartupTests {
+    @Test func testInternalPiPCancellationCleansStartedCapture() async {
+        let rig = AcceptanceRig(mode: .local, pip: AcceptanceCancelledPiP())
+        await rig.session.prepare(config: rig.config)
+        await rig.session.start()
+        let status = await rig.session.currentStatus
+        #expect(status.phase == .failed)
+        #expect(status.failure == .pipFailed)
+        #expect(status.identity == nil)
+        #expect(rig.source.stopCount == 1)
+        await rig.cleanup()
+    }
+}

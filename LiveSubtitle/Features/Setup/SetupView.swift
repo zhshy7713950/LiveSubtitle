@@ -52,6 +52,9 @@ struct SetupView: View {
                 }
 
                 Section {
+                    Text("共享整个屏幕后，请关闭系统共享面板返回本 App，等字幕小窗出现后再打开视频。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                     Button("开始翻译") {
                         viewModel.start()
                     }

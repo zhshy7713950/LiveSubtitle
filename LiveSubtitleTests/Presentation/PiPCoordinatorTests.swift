@@ -326,14 +326,33 @@ extension PiPCoordinatorTests {
         catch let error as FailureCode { #expect(error == .pipFailed) }
     }
     @Test @MainActor func testReadinessCancellationReleasesWaiter() async throws {
-        let task = Task { @MainActor in try await waitForPiPReadiness(clock: Task10Clock()) { false } }
+        let clock = Task10Clock()
+        let task = Task { @MainActor in try await waitForPiPReadiness(clock: clock) { false } }
+        while clock.waiterCount == 0 { await Task.yield() }
         task.cancel()
         do { try await task.value; Issue.record("Cancelled readiness succeeded") }
         catch { #expect(error is CancellationError) }
+        #expect(clock.waiterCount == 0)
     }
 }
 #endif
 
 #if !TASK11_HOST_CHECK
 @MainActor private final class PiPReadinessProbe { var checked = false }
+#endif
+
+#if !TASK11_HOST_CHECK
+extension PiPCoordinatorTests {
+    @Test @MainActor func testReadinessAfterDeadlineIsRejected() async throws {
+        let clock = Task10Clock()
+        let probe = PiPReadinessProbe()
+        let task = Task { @MainActor in
+            try await waitForPiPReadiness(clock: clock) { probe.checked = true; return clock.now().uptimeNanoseconds >= 3_000_000_000 }
+        }
+        while !probe.checked { await Task.yield() }
+        clock.advance(toMilliseconds: 3_001)
+        do { try await task.value; Issue.record("Readiness after deadline was accepted") }
+        catch let error as FailureCode { #expect(error == .pipFailed) }
+    }
+}
 #endif

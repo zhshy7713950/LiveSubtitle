@@ -303,11 +303,11 @@ func checkLocalFailureCancelsGeneration() async throws {
     try await task10Eventually("initial local job did not start") { await rig.local.receivedJobs.count == 1 }
     rig.clock.advance(toMilliseconds: 6_000)
     try await task10Eventually("local deadline did not fail") {
-        await !task10Failed(rig.collector.events).isEmpty
+        await task10Failed(rig.collector.events).count == 3
     }
     await task10Flush()
-    try task10Require(await task10Failed(rig.collector.events).count == 1,
-                      "one local terminal failure produced multiple failures")
+    try task10Require(await task10Failed(rig.collector.events).count == 3,
+                      "each valid deadline must produce exactly one failure")
     try task10Require(await rig.local.receivedJobs.count == 1,
                       "local terminal failure started additional queued work")
     await task10Stop(rig)
@@ -366,5 +366,86 @@ struct FallbackTests {
         try await checkOutputControlSaturationIsExplicit()
     }
     @Test func testFallbackCandidateRevalidated() async throws { try await checkFallbackCandidateRevalidated() }
+}
+#endif
+
+#if !TASK10_HOST_CHECK
+struct StaleSchedulingFailureTests {
+    @Test(arguments: [RequestedMode.ai, .local])
+    func removedFailureDoesNotCancelOtherWork(mode: RequestedMode) async throws {
+        let rig = try await task10MakeRig(mode: mode)
+        let translator = mode == .ai ? rig.ai : rig.local
+        let first = task10Segment()
+        let next = task10Segment()
+        await rig.scheduler.submit(first)
+        await rig.scheduler.submit(next)
+        try await task10Eventually("initial job did not start") { await translator.receivedJobs.count >= 1 }
+        let job = await translator.receivedJobs[0]
+        await translator.fail(job, reason: .network)
+        try await task10Eventually("failure did not reach output") { await task10Failed(rig.collector.events).count == 1 }
+        await rig.scheduler.retainOnly(segmentIDs: [next.segmentID])
+        try await task10Eventually("remaining segment was stranded by stale failure") {
+            await translator.receivedJobs.contains { $0.segmentID == next.segmentID }
+        }
+        let nextJob = await translator.receivedJobs.first { $0.segmentID == next.segmentID }!
+        await translator.succeed(nextJob)
+        try await task10Eventually("other work was cancelled by removed failure") {
+            await task10Translations(rig.collector.events).contains { $0.job.jobID == nextJob.jobID }
+        }
+        await task10Stop(rig)
+    }
+
+    @Test func revisedFailureResumesWithoutResettingBudget() async throws {
+        let rig = try await task10MakeRig()
+        let segment = task10Segment()
+        await rig.scheduler.submit(segment)
+        try await task10Eventually("first job missing") { await rig.ai.receivedJobs.count == 1 }
+        await rig.ai.fail(await rig.ai.receivedJobs[0], reason: .server)
+        try await task10Eventually("failure missing") { await task10Failed(rig.collector.events).count == 1 }
+        rig.clock.advance(toMilliseconds: 800)
+        await rig.scheduler.submit(task10Segment(id: segment.segmentID, revision: 1))
+        try await task10Eventually("revision stranded after stale failure") { await rig.ai.receivedJobs.count == 2 }
+        await rig.ai.succeed(await rig.ai.receivedJobs[1])
+        rig.clock.advance(toMilliseconds: 1_600)
+        await rig.scheduler.submit(task10Segment(id: segment.segmentID, revision: 2))
+        try await task10Eventually("budget was reset while rejecting failure") { await rig.local.receivedJobs.count == 1 }
+        #expect(await rig.ai.receivedJobs.count == 2)
+        await task10Stop(rig)
+    }
+}
+#endif
+
+#if !TASK10_HOST_CHECK
+extension StaleSchedulingFailureTests {
+    @Test func rejectingOneFailureDoesNotReleaseAnotherOrNewGeneration() async throws {
+        let rig = try await task10MakeRig()
+        for _ in 0..<3 { await rig.scheduler.submit(task10Segment()) }
+        try await task10Eventually("two requests did not start") { await rig.ai.receivedJobs.count == 2 }
+        let jobs = await rig.ai.receivedJobs
+        await rig.ai.fail(jobs[0], reason: .network)
+        await rig.ai.fail(jobs[1], reason: .server)
+        try await task10Eventually("two failures were not buffered") { await task10Failed(rig.collector.events).count == 2 }
+        await rig.scheduler.discardFailure(for: jobs[0])
+        await task10Flush()
+        #expect(await rig.ai.receivedJobs.count == 2)
+        await rig.scheduler.discardFailure(for: jobs[1])
+        try await task10Eventually("queue did not resume after both rejections") { await rig.ai.receivedJobs.count == 3 }
+        let third = await rig.ai.receivedJobs[2]
+        #expect(third.deadline == task10Instant(6_000))
+        let next = task10Identity(sessionID: rig.identity.sessionID, engineEpoch: 9)
+        try await rig.scheduler.setMode(.ai, identity: next, config: rig.config, profile: rig.profile)
+        await rig.scheduler.submit(task10Segment())
+        try await task10Eventually("new generation did not start") { await rig.ai.receivedJobs.count == 4 }
+        let newJob = await rig.ai.receivedJobs[3]
+        await rig.ai.fail(newJob, reason: .network)
+        try await task10Eventually("new fault missing") { await task10Failed(rig.collector.events).count == 3 }
+        await rig.scheduler.submit(task10Segment())
+        await rig.scheduler.discardFailure(for: jobs[0])
+        await task10Flush()
+        #expect(await rig.ai.receivedJobs.count == 4, "old rejection resumed new generation")
+        await rig.scheduler.discardFailure(for: newJob)
+        try await task10Eventually("new rejection did not resume queue") { await rig.ai.receivedJobs.count == 5 }
+        await task10Stop(rig)
+    }
 }
 #endif

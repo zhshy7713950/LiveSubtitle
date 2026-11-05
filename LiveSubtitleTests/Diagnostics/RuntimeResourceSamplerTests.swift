@@ -170,6 +170,23 @@ private func checkConcurrentStopsWaitForInflightRecord() async throws {
 }
 #else
 struct RuntimeResourceSamplerTests {
+    @Test func testSynchronousMetricsShareRunIDAndRotateAfterClear() async {
+        let emitted = Mutex<[DiagnosticSample]>([])
+        let recorder = DiagnosticsRecorder(clock: ResourceClock(), sink: { sample in
+            emitted.withLock { $0.append(sample) }
+        })
+        recorder.recordImmediately(.translationQueued(count: 2))
+        await recorder.record(.thermalState(.nominal))
+        let first = await recorder.snapshot()
+        #expect(first.count == 2)
+        #expect(first[0].sessionID == first[1].sessionID)
+        await recorder.clearSession()
+        recorder.recordImmediately(.translationQueued(count: 0))
+        let next = await recorder.snapshot()
+        #expect(next.count == 1)
+        #expect(next[0].sessionID != first[0].sessionID)
+        #expect(emitted.withLock { $0.count } == 3)
+    }
     @Test func testSamplingLifecycle() async throws { try await checkSamplingLifecycle() }
     @Test func testRecorderBoundedRing() async throws { try await checkRecorderBoundedRing() }
     @Test func testUnavailableMemoryStillRecordsThermal() async throws {

@@ -79,6 +79,7 @@ actor TranslationScheduler: TranslationScheduling {
     private var readyTasks: [UUID: Task<Void, Never>] = [:]
     private var aiLocked = true
     private var fallbackCandidate: Submission?
+    private var pendingFailures: [UUID: TranslationJob] = [:]
 
     init(
         aiTranslator: any Translator,
@@ -127,14 +128,17 @@ actor TranslationScheduler: TranslationScheduling {
         if let previous = submissions[segment.segmentID],
            previous.segment.sourceRevision >= segment.sourceRevision { return }
 
+        if submissions[segment.segmentID] == nil, submissions.count >= RuntimePolicy.retainedSegmentLimit,
+           let oldest = submissions.min(by: { $0.value.createdAt.uptimeNanoseconds < $1.value.createdAt.uptimeNanoseconds })?.key {
+            cancelWork(for: oldest, emitDropped: true)
+            submissions.removeValue(forKey: oldest)
+            aiUsage.removeValue(forKey: oldest)
+        }
         let submission = Submission(segment: segment, createdAt: clock.now())
         submissions[segment.segmentID] = submission
         cancelWork(for: segment.segmentID, emitDropped: true)
 
-        if mode == .ai && aiLocked {
-            fallbackCandidate = submission
-            return
-        }
+        if !pendingFailures.isEmpty { fallbackCandidate = submission }
         let useAI = mode == .ai && allowsAI(segment)
         enqueue(submission, useAI: useAI)
     }
@@ -147,6 +151,7 @@ actor TranslationScheduler: TranslationScheduling {
         if let fallbackCandidate, !segmentIDs.contains(fallbackCandidate.segment.segmentID) {
             self.fallbackCandidate = nil
         }
+        pendingFailures = pendingFailures.filter { segmentIDs.contains($0.value.segmentID) }
         for job in jobs.values.map(\.job) where !segmentIDs.contains(job.segmentID) {
             drop(job)
         }
@@ -155,6 +160,17 @@ actor TranslationScheduler: TranslationScheduling {
             work.task.cancel()
             emit(.dropped(job: work.job))
         }
+        fallbackCandidate = pendingFailures.isEmpty ? nil : latestCandidate()
+        pump()
+    }
+
+    func discardFailure(for job: TranslationJob) async {
+        guard identity == job.identity, let pending = pendingFailures[job.jobID],
+              pending.identity == job.identity, pending.segmentID == job.segmentID,
+              pending.sourceRevision == job.sourceRevision else { return }
+        pendingFailures.removeValue(forKey: job.jobID)
+        fallbackCandidate = pendingFailures.isEmpty ? nil : latestCandidate()
+        pump()
     }
 
     func setMode(
@@ -248,6 +264,7 @@ actor TranslationScheduler: TranslationScheduling {
         aiUsage.removeAll()
         retainedSegmentIDs = nil
         fallbackCandidate = nil
+        pendingFailures.removeAll()
         for task in lifetimeTasks.values { task.cancel() }
         for task in firstTextTasks { task.value.cancel() }
         for task in readyTasks.values { task.cancel() }
@@ -312,9 +329,9 @@ actor TranslationScheduler: TranslationScheduling {
     }
 
     private func pump() {
-        guard accepting else { return }
+        guard accepting, pendingFailures.isEmpty else { return }
         let now = clock.now()
-        while accepting, let job = queue.popFirst(where: { job in
+        while accepting, pendingFailures.isEmpty, let job = queue.popFirst(where: { job in
             guard let state = jobs[job.jobID], state.startAfter.uptimeNanoseconds <= now.uptimeNanoseconds else {
                 return false
             }
@@ -457,34 +474,22 @@ actor TranslationScheduler: TranslationScheduling {
     private func handleFailure(_ job: TranslationJob, reason: FailureCode) {
         guard jobs[job.jobID] != nil, identity == job.identity, isRetained(job.segmentID),
               submissions[job.segmentID]?.segment.sourceRevision == job.sourceRevision else { return }
-        if job.cloudProfile != nil {
-            let candidate = latestCandidate()
-            aiLocked = true
-            fallbackCandidate = candidate
-            emit(.failed(job: job, reason: reason))
+        let firstPendingFailure = pendingFailures.isEmpty
+        fallbackCandidate = latestCandidate()
+        // Retire just this work. Preserve other jobs and their deadlines until the
+        // coordinator either commits a mode change/stop or rejects this fault.
+        pendingFailures[job.jobID] = job
+        _ = queue.remove(jobID: job.jobID)
+        retire(job.jobID)
+        running[job.jobID]?.task.cancel()
+        emit(.failed(job: job, reason: reason))
+        if job.cloudProfile != nil && firstPendingFailure {
             emit(.fallbackRequested(identity: job.identity, reason: reason))
-            for other in jobs.values.map(\.job) {
-                _ = queue.remove(jobID: other.jobID)
-                retire(other.jobID)
-                if other.jobID != job.jobID {
-                    running[other.jobID]?.task.cancel()
-                    emit(.dropped(job: other))
-                }
-            }
-            running[job.jobID]?.task.cancel()
-        } else {
-            accepting = false
-            clearQueue()
-            for other in jobs.values.map(\.job) {
-                retire(other.jobID)
-                running[other.jobID]?.task.cancel()
-            }
-            emit(.failed(job: job, reason: reason))
         }
     }
 
     private func latestCandidate() -> Submission? {
-        jobs.values.compactMap { submissions[$0.job.segmentID] }.max { lhs, rhs in
+        (jobs.values.map(\.job) + Array(pendingFailures.values)).compactMap { submissions[$0.segmentID] }.max { lhs, rhs in
             if lhs.createdAt.uptimeNanoseconds == rhs.createdAt.uptimeNanoseconds {
                 return lhs.segment.sourceRevision < rhs.segment.sourceRevision
             }
@@ -493,6 +498,8 @@ actor TranslationScheduler: TranslationScheduling {
     }
 
     private func cancelWork(for segmentID: UUID, emitDropped: Bool) {
+        pendingFailures = pendingFailures.filter { $0.value.segmentID != segmentID }
+        if pendingFailures.isEmpty { fallbackCandidate = nil }
         for job in queue.remove(segmentID: segmentID) {
             retire(job.jobID)
             if emitDropped { emit(.dropped(job: job)) }

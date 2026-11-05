@@ -112,6 +112,8 @@ final class Task10Clock: MonotonicClock, Sendable {
         MonotonicInstant(uptimeNanoseconds: state.withLock { $0.ticks })
     }
 
+    var waiterCount: Int { state.withLock { $0.waiters.count } }
+
     func advance(toMilliseconds milliseconds: UInt64) {
         advanceHoldingWaiters(toMilliseconds: milliseconds)
         resumeWaiters()
@@ -320,10 +322,10 @@ func checkDiagnosticsReportClearedQueueForModeAndFailure() async throws {
     try task10Require(diagnostics.queueCounts.last == 4, "local pending queue was not reported")
     await rig.local.fail(await rig.local.receivedJobs[0], reason: .localTranslationFailed)
     try await task10Eventually("local failure was not processed") { await task10Failed(rig.collector.events).count == 1 }
-    try task10Require(diagnostics.queueCounts.last == 0, "local failure did not report the cleared queue")
+    try task10Require(diagnostics.queueCounts.last == 4, "unacknowledged failure destroyed pending work")
     let beforeStop = diagnostics.queueCounts.count
     await task10Stop(rig)
-    try task10Require(diagnostics.queueCounts.count == beforeStop + 1 && diagnostics.queueCounts.last == 0,
+    try task10Require(diagnostics.queueCounts.count > beforeStop && diagnostics.queueCounts.last == 0,
                       "stopping an empty queue did not publish a final zero")
     try task10Require(diagnostics.queueCounts.allSatisfy { (0...RuntimePolicy.pendingTranslationLimit).contains($0) },
                       "mode/failure diagnostics exceeded the queue limit")

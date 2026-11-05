@@ -116,6 +116,8 @@ actor FeatureSessionDouble: SessionCoordinating {
     private let statusEvents = FeatureStreamBox<SessionStatus>()
     private var willChangeContinuation: CheckedContinuation<Void, Never>?
     private var shouldSuspendWillChange = false
+    private var shouldSuspendStart = false
+    private var startContinuation: CheckedContinuation<Void, Never>?
     private(set) var preparedConfigs: [SessionConfig] = []
     private(set) var stopReasons: [StopReason] = []
     private(set) var displays: [DisplayPreferences] = []
@@ -131,11 +133,21 @@ actor FeatureSessionDouble: SessionCoordinating {
         log.append("prepare")
     }
 
-    func start() async { log.append("start") }
+    func suspendNextStart() { shouldSuspendStart = true }
+    var isWaitingForStart: Bool { startContinuation != nil }
+    func releaseStart() { startContinuation?.resume(); startContinuation = nil }
+    func start() async {
+        log.append("start")
+        if shouldSuspendStart {
+            shouldSuspendStart = false
+            await withCheckedContinuation { startContinuation = $0 }
+        }
+    }
 
     func stop(reason: StopReason) async {
         stopReasons.append(reason)
         log.append("stop")
+        releaseStart()
     }
 
     func setDisplay(_ preferences: DisplayPreferences) async {

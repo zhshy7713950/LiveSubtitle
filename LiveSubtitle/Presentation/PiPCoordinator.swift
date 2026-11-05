@@ -31,13 +31,13 @@ func waitForPiPReadiness(clock: any MonotonicClock, isPossible: () -> Bool) asyn
         UInt64(duration.components.seconds) * 1_000_000_000 + UInt64(duration.components.attoseconds / 1_000_000_000)
     }
     let deadline = clock.now().uptimeNanoseconds + nanoseconds(RuntimePolicy.pipReadinessTimeout)
-    while !isPossible() {
+    while true {
         try Task.checkCancellation()
         let now = clock.now().uptimeNanoseconds
         guard now < deadline else { throw FailureCode.pipFailed }
+        if isPossible() { return }
         try await clock.sleep(until: .init(uptimeNanoseconds: min(deadline, now + nanoseconds(RuntimePolicy.pipReadinessPollInterval))))
     }
-    try Task.checkCancellation()
 }
 
 @MainActor
@@ -351,6 +351,8 @@ final class AVPiPSystemAdapter: NSObject, AVPictureInPictureSampleBufferPlayback
     }
 
     var isSupported: Bool { AVPictureInPictureController.isPictureInPictureSupported() }
+    // Initial capture waits for the sharing panel in LifecycleAudioSource.
+    // Restored PiP must also be able to restart during the background transition.
     var isPossible: Bool { controller?.isPictureInPicturePossible ?? false }
     var isSuspended: Bool { controller?.isPictureInPictureSuspended ?? false }
 
@@ -369,6 +371,15 @@ final class AVPiPSystemAdapter: NSObject, AVPictureInPictureSampleBufferPlayback
         _ pictureInPictureController: AVPictureInPictureController,
         failedToStartPictureInPictureWithError error: any Error
     ) {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--validation-metrics") {
+            let failure = error as NSError
+            let underlying = failure.userInfo[NSUnderlyingErrorKey] as? NSError
+            // Closed domain classification and numeric codes only; never localized text/userInfo.
+            let domain = failure.domain == AVKitErrorDomain ? "avkit" : "other"
+            print("TASK14_METRIC pip_start_domain=\(domain) code=\(failure.code) underlying_code=\(underlying?.code ?? 0)")
+        }
+        #endif
         eventHandler?(.failed)
     }
 

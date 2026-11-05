@@ -17,6 +17,8 @@ protocol TranslationScheduling: Sendable {
     func submit(_ segment: CaptionSegment) async
     /// Remove job references and revision indexes when the store evicts a segment.
     func retainOnly(segmentIDs: Set<UUID>) async
+    /// Reject only the matching buffered fault after checking current segment/version ownership.
+    func discardFailure(for job: TranslationJob) async
     /// Caller owns epoch increments. Only explicit user action enables AI.
     func setMode(_ mode: EffectiveMode, identity: SessionIdentity, config: SessionConfig, profile: CloudProfile?) async throws
     func stop() async

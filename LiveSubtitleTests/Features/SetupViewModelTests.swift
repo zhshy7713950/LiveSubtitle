@@ -305,3 +305,35 @@ struct SetupViewModelTests {
     @Test @MainActor func userFacingStates() async throws { try await testUserFacingStates() }
 }
 #endif
+
+#if !FEATURES_HOST_CHECK
+extension SetupViewModelTests {
+    @Test(arguments: ["stop", "cancel", "language", "mode"])
+    @MainActor func startupCancellationReachesSessionBeforeWaiting(action: String) async throws {
+        let rig = FeatureTestRig()
+        let setup = rig.makeSetupViewModel()
+        await setup.load()
+        await rig.session.suspendNextStart()
+        setup.start()
+        try await featureEventually("start did not suspend") { await rig.session.isWaitingForStart }
+        let operation = Task { @MainActor in
+            switch action {
+            case "stop": await setup.stop()
+            case "cancel": setup.cancelPreparation()
+            case "language": await setup.selectSourceLanguage(.init(rawValue: "en-GB"))
+            default: await setup.selectMode(.ai)
+            }
+        }
+        var reachedStop = false
+        for _ in 0..<1_000 {
+            if await !rig.session.stopReasons.isEmpty { reachedStop = true; break }
+            await Task.yield()
+        }
+        // Always release the seam, including on RED, so a failed test cannot hang.
+        await rig.session.releaseStart()
+        await operation.value
+        #expect(reachedStop, "UI waited for startup before invoking session.stop")
+        try await featureMainActorEventually("cancellation remained busy") { !setup.isPreparing }
+    }
+}
+#endif

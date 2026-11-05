@@ -64,7 +64,7 @@ func testOldSessionCallbacksCannotAffectRestart() async throws {
     let rig = await SessionTestRig.make(profile: profile)
     await rig.prepareAndStart(mode: .ai, profileID: profile.id)
     let oldIdentity = try await sessionUnwrapIdentity(rig.coordinator)
-    await rig.scheduler.emit(.fallbackRequested(identity: oldIdentity, reason: .network))
+    try await emitCurrentFailure(rig, identity: oldIdentity, profile: profile)
     try await sessionEventually("fallback did not begin") {
         await rig.coordinator.currentStatus.effectiveMode == .localFallback
     }
@@ -116,7 +116,7 @@ func testFallbackAndManualRecovery() async throws {
     let rig = await SessionTestRig.make(profile: profile)
     await rig.prepareAndStart(mode: .ai, profileID: profile.id)
     let initial = try await sessionUnwrapIdentity(rig.coordinator)
-    await rig.scheduler.emit(.fallbackRequested(identity: initial, reason: .network))
+    try await emitCurrentFailure(rig, identity: initial, profile: profile)
     try await sessionEventually("fallback did not complete") {
         await rig.coordinator.currentStatus.effectiveMode == .localFallback
     }
@@ -126,7 +126,7 @@ func testFallbackAndManualRecovery() async throws {
 
     await rig.segmenter.emit(.upsert(makeCaptionSegment()))
     try await sessionEventually("fallback segment was not submitted") {
-        await rig.scheduler.submittedSegments.count == 1
+        await rig.scheduler.submittedSegments.count == 2
     }
     try sessionRequire(await rig.coordinator.currentStatus.effectiveMode == .localFallback, "new segment re-enabled AI")
     let submittedBeforeRecovery = await rig.scheduler.submittedSegments.count
@@ -203,13 +203,13 @@ func testModeChangeKeepsSpeechStreamAlive() async throws {
     try sessionRequire(await rig.coordinator.currentStatus.effectiveMode == .local, "AI to local failed")
     await rig.coordinator.selectMode(.ai)
     let aiIdentity = try await sessionUnwrapIdentity(rig.coordinator)
-    await rig.scheduler.emit(.fallbackRequested(identity: aiIdentity, reason: .network))
+    try await emitCurrentFailure(rig, identity: aiIdentity, profile: profile)
     try await sessionEventually("fallback did not finish") {
         await rig.coordinator.currentStatus.effectiveMode == .localFallback
     }
     await rig.segmenter.emit(.upsert(makeCaptionSegment()))
     try await sessionEventually("segment after mode changes was lost") {
-        await rig.scheduler.submittedSegments.count == 1
+        await rig.scheduler.submittedSegments.count == 2
     }
     try sessionRequire(await rig.speech.startCount == 1, "mode change restarted speech")
     try sessionRequire(await rig.segmenter.startCount == 1, "mode change restarted segmenting")
@@ -550,5 +550,55 @@ struct SessionCoordinatorTests {
     @Test func stopClearsAfterInflightSegmentWrite() async throws { try await testStopClearsAfterInflightSegmentWrite() }
     @Test func setModeCancellationStopsAndReleasesBarrier() async throws { try await testSetModeCancellationStopsAndReleasesBarrier() }
     @Test func profileChangeThenExplicitAIUsesNewRevision() async throws { try await testProfileChangeThenExplicitAIUsesNewRevision() }
+}
+#endif
+
+private func emitCurrentFailure(_ rig: SessionTestRig, identity: SessionIdentity, profile: CloudProfile) async throws {
+    let segment = makeCaptionSegment()
+    let baseline = await rig.scheduler.submittedSegments.count
+    await rig.segmenter.emit(.upsert(segment))
+    try await sessionEventually("fault segment was not submitted") { await rig.scheduler.submittedSegments.count == baseline + 1 }
+    let job = makeTranslationJob(identity: identity, segment: segment, cloudProfile: profile)
+    await rig.scheduler.emit(.failed(job: job, reason: .network))
+}
+
+#if !SESSION_HOST_CHECK
+extension SessionCoordinatorTests {
+    @Test(arguments: [true, false])
+    func bufferedFailureAndAdvisoryCannotAffectChangedSegment(remove: Bool) async throws {
+        let profile = makeCloudProfile()
+        let rig = await SessionTestRig.make(profile: profile)
+        await rig.prepareAndStart(mode: .ai, profileID: profile.id)
+        let identity = try await sessionUnwrapIdentity(rig.coordinator)
+        let segment = makeCaptionSegment()
+        await rig.segmenter.emit(.upsert(segment))
+        try await sessionEventually("segment was not rendered") {
+            await rig.renderer.snapshots.last?.segments.contains { $0.segmentID == segment.segmentID } == true
+        }
+        let job = makeTranslationJob(identity: identity, segment: segment, cloudProfile: profile)
+        await rig.store.suspendSnapshot()
+        await rig.scheduler.emit(.failed(job: job, reason: .network))
+        try await sessionEventually("failure did not reach snapshot barrier") { await rig.store.snapshotWaiting }
+        if remove {
+            await rig.segmenter.emit(.remove(segmentID: segment.segmentID))
+            try await sessionEventually("segment was not removed") {
+                await rig.scheduler.retainedIDs.last?.isEmpty == true
+            }
+        } else {
+            let revised = CaptionSegment(segmentID: segment.segmentID, utteranceID: segment.utteranceID,
+                audioRange: segment.audioRange, sourceRevision: segment.sourceRevision + 1,
+                sourceText: "Revised synthetic input.", stability: segment.stability, translationState: .pending)
+            await rig.segmenter.emit(.upsert(revised))
+            try await sessionEventually("new revision was not submitted") { await rig.scheduler.submittedSegments.count == 2 }
+        }
+        await rig.store.releaseSnapshot()
+        await rig.scheduler.emit(.fallbackRequested(identity: identity, reason: .network))
+        try await sessionEventually("stale fault was not rejected") { await rig.scheduler.discardedFailures.count == 1 }
+        for _ in 0..<100 { await Task.yield() }
+        #expect(await rig.coordinator.currentStatus.identity == identity)
+        #expect(await rig.coordinator.currentStatus.effectiveMode == .ai)
+        #expect(await rig.coordinator.currentStatus.phase == .running)
+        await rig.coordinator.stop(reason: .user)
+    }
 }
 #endif

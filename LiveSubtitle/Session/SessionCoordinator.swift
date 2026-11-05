@@ -306,6 +306,8 @@ actor SessionCoordinator: SessionCoordinating {
     }
 
     private func performStart(generation: UInt64, config: SessionConfig) async {
+        var captureStarted = false
+        var startupFailure: FailureCode = .captureFailed
         do {
             let loadedProfile = try await loadCloudProfile(for: config)
             guard isStartCurrent(generation) else { return }
@@ -330,6 +332,8 @@ actor SessionCoordinator: SessionCoordinating {
             let source = try await dependencies.mainActor.startAudio(
                 config: CaptureConfig(identity: sessionIdentity, sourceLanguage: config.sourceLanguage)
             )
+            captureStarted = true
+            startupFailure = .speechFailed
             guard isCurrent(sessionIdentity) else { return }
             let format = try await dependencies.speech.inputFormat(source: config.sourceLanguage)
             let processed = await dependencies.audioProcessing.process(source, target: format)
@@ -349,6 +353,7 @@ actor SessionCoordinator: SessionCoordinating {
                 display: DisplayPreferences(displayCount: config.displayCount, displayStyle: config.displayStyle)
             )
             guard isCurrent(sessionIdentity) else { return }
+            startupFailure = .pipFailed
             let pipEvents = try await dependencies.mainActor.startPiP(sessionID: sessionIdentity.sessionID)
             guard isCurrent(sessionIdentity) else { return }
 
@@ -363,7 +368,9 @@ actor SessionCoordinator: SessionCoordinating {
             publishStatus()
             await refreshCaptions(status: .waitingForAudio)
         } catch is CancellationError {
-            if isStartCurrent(generation) { startOutcome = .pickerCancelled }
+            if isStartCurrent(generation) {
+                startOutcome = captureStarted ? .failed(startupFailure) : .pickerCancelled
+            }
         } catch let code as FailureCode {
             if isStartCurrent(generation) { startOutcome = .failed(code) }
         } catch {
@@ -463,8 +470,9 @@ actor SessionCoordinator: SessionCoordinating {
             switch event {
             case .translation(let job, let update):
                 await receiveTranslation(job: job, update: update, eventIdentity: identity)
-            case .fallbackRequested(let eventIdentity, let reason):
-                await receiveFallback(eventIdentity: eventIdentity, reason: reason)
+            case .fallbackRequested:
+                // Advisory only: the paired failed(job:) supplies the revision and retention scope.
+                continue
             case .dropped(let job):
                 guard isValid(identity, scope: .speech), isCurrent(job.identity) else { continue }
             case .failed(let job, let reason):
@@ -492,17 +500,26 @@ actor SessionCoordinator: SessionCoordinating {
 
     private func receiveSchedulerFailure(job: TranslationJob, reason: FailureCode, eventIdentity: SessionIdentity) async {
         guard isValid(eventIdentity, scope: .speech), isCurrent(job.identity),
-              retainedRevisions[job.segmentID] == job.sourceRevision else { return }
+              retainedRevisions[job.segmentID] == job.sourceRevision else {
+            await dependencies.scheduler.discardFailure(for: job)
+            return
+        }
         let mode = effectiveMode
         guard let snapshot = await dependencies.captions.snapshot(
             mode: mode,
             status: mode == .localFallback ? .localFallback : .listening
-        ) else { return }
+        ) else {
+            await dependencies.scheduler.discardFailure(for: job)
+            return
+        }
         guard isValid(eventIdentity, scope: .speech), isCurrent(job.identity),
               retainedRevisions[job.segmentID] == job.sourceRevision,
               snapshot.segments.contains(where: {
                   $0.segmentID == job.segmentID && $0.sourceRevision == job.sourceRevision
-              }) else { return }
+              }) else {
+            await dependencies.scheduler.discardFailure(for: job)
+            return
+        }
         if job.cloudProfile != nil && mode == .ai {
             await receiveFallback(eventIdentity: job.identity, reason: reason)
         } else {
