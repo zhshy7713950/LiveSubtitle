@@ -255,6 +255,24 @@ final class SubtitleRenderer: SubtitleRendering {
         clear()
     }
 
+    /// Prime AVKit with a real in-memory frame before it can report PiP readiness.
+    func prepareFirstFrame(sessionID: UUID) async throws {
+        activate(sessionID: sessionID)
+        if renderedInput != nil { return }
+        let token = workID
+        await clearTask?.value
+        let input = SubtitleLayoutInput(waitingForAudio: ())
+        let frame = try await builder.make(input: input, size: renderSize,
+                                           presentationTimeStamp: nextPTS(now: clock.now().uptimeNanoseconds))
+        try Task.checkCancellation()
+        guard activeSessionID == sessionID, workID == token else { throw CancellationError() }
+        try output.enqueue(frame)
+        acceptedInput = input
+        renderedInput = input
+        lastRenderUptime = clock.now().uptimeNanoseconds
+        scheduleHeartbeat()
+    }
+
     func deactivate(sessionID: UUID) {
         guard activeSessionID == sessionID else { return }
         activeSessionID = nil

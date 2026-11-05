@@ -20,6 +20,13 @@ struct SubtitleLayoutInput: Equatable, Sendable {
     let translationOnly: Bool
     let statusText: String?
 
+    init(waitingForAudio: Void) {
+        segments = []
+        displayCount = RuntimePolicy.defaultDisplayCount
+        translationOnly = false
+        statusText = "等待声音"
+    }
+
     init(snapshot: SubtitleSnapshot) {
         segments = snapshot.segments.map { segment in
             let translation: String?

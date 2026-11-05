@@ -20,8 +20,16 @@ protocol PiPSystemAdapting: AnyObject {
     var isPossible: Bool { get }
     var isSuspended: Bool { get }
     var eventHandler: ((PiPSystemEvent) -> Void)? { get set }
+    func waitUntilPossible() async throws
     func start()
     func stop()
+}
+
+@MainActor
+extension PiPSystemAdapting {
+    func waitUntilPossible() async throws {
+        guard isPossible else { throw FailureCode.pipFailed }
+    }
 }
 
 @MainActor
@@ -164,9 +172,20 @@ final class PiPCoordinator: PiPControlling {
         invalidateCurrent(clearRenderer: !replacingSameSession)
 
         let system = systemFactory(renderer)
-        guard system.isSupported, system.isPossible else {
-            renderer.deactivate(sessionID: sessionID)
-            throw FailureCode.pipFailed
+        guard system.isSupported else { throw FailureCode.pipFailed }
+        self.system = system
+        self.sessionID = sessionID
+        renderer.activate(sessionID: sessionID)
+        do {
+            if !replacingSameSession {
+                try await renderer.prepareFirstFrame(sessionID: sessionID)
+            }
+            try await system.waitUntilPossible()
+            try Task.checkCancellation()
+            guard self.generation == generation else { throw CancellationError() }
+        } catch {
+            if self.generation == generation { invalidateCurrent(clearRenderer: true) }
+            throw error
         }
 
         let output = PiPEventOutput()
@@ -317,6 +336,16 @@ final class AVPiPSystemAdapter: NSObject, AVPictureInPictureSampleBufferPlayback
     var isSupported: Bool { AVPictureInPictureController.isPictureInPictureSupported() }
     var isPossible: Bool { controller?.isPictureInPicturePossible ?? false }
     var isSuspended: Bool { controller?.isPictureInPictureSuspended ?? false }
+
+    func waitUntilPossible() async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: RuntimePolicy.pipReadinessTimeout)
+        while !isPossible {
+            try Task.checkCancellation()
+            guard clock.now < deadline else { throw FailureCode.pipFailed }
+            try await clock.sleep(until: min(deadline, clock.now.advanced(by: RuntimePolicy.pipReadinessPollInterval)))
+        }
+    }
 
     func start() { controller?.startPictureInPicture() }
     func stop() { controller?.stopPictureInPicture() }

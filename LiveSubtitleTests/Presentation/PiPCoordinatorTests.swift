@@ -282,3 +282,32 @@ struct PiPCoordinatorTests {
     }
 }
 #endif
+
+#if !TASK11_HOST_CHECK
+@MainActor
+private final class FrameReadyPiP: PiPSystemAdapting {
+    let output: Task11FrameOutput
+    init(output: Task11FrameOutput) { self.output = output }
+    var isSupported: Bool { true }
+    var isPossible: Bool { output.visibleFrame != nil }
+    var isSuspended: Bool { false }
+    var eventHandler: ((PiPSystemEvent) -> Void)?
+    private(set) var starts = 0
+    func start() { starts += 1 }
+    func stop() {}
+}
+
+extension PiPCoordinatorTests {
+    @Test @MainActor func testFirstFramePrecedesReadinessCheck() async throws {
+        let output = Task11FrameOutput()
+        let renderer = SubtitleRenderer(output: output, clock: Task11Clock())
+        let system = FrameReadyPiP(output: output)
+        let coordinator = PiPCoordinator(renderer: renderer, systemFactory: { _ in system })
+        let id = UUID()
+        _ = try await coordinator.start(sessionID: id)
+        #expect(output.visibleFrame != nil)
+        #expect(system.starts == 1)
+        await coordinator.stop(sessionID: id)
+    }
+}
+#endif
