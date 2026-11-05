@@ -241,11 +241,14 @@ struct Task10Rig {
     let consumer: Task<Void, Never>
 }
 
-func task10MakeRig(mode: RequestedMode = .ai) async throws -> Task10Rig {
+func task10MakeRig(
+    mode: RequestedMode = .ai,
+    onDiagnostic: (@Sendable (DiagnosticEvent) -> Void)? = nil
+) async throws -> Task10Rig {
     let ai = Task10Translator()
     let local = Task10Translator()
     let clock = Task10Clock()
-    let scheduler = TranslationScheduler(aiTranslator: ai, localTranslator: local, clock: clock)
+    let scheduler = TranslationScheduler(aiTranslator: ai, localTranslator: local, clock: clock, onDiagnostic: onDiagnostic)
     let profile = task10Profile()
     let identity = task10Identity()
     let config = task10Config(mode: mode, profileID: profile.id)
@@ -259,6 +262,71 @@ func task10MakeRig(mode: RequestedMode = .ai) async throws -> Task10Rig {
 func task10Stop(_ rig: Task10Rig) async {
     await rig.scheduler.stop()
     await rig.consumer.value
+}
+
+final class Task10DiagnosticRecorder: Sendable {
+    private struct State {
+        var queueCounts: [Int] = []
+        var droppedJobs = 0
+        var unexpectedEvents = 0
+    }
+
+    private let state = Mutex(State())
+
+    var queueCounts: [Int] { state.withLock { $0.queueCounts } }
+    var droppedJobs: Int { state.withLock { $0.droppedJobs } }
+    var unexpectedEvents: Int { state.withLock { $0.unexpectedEvents } }
+
+    func record(_ event: DiagnosticEvent) {
+        state.withLock { state in
+            switch event {
+            case .translationQueued(let count): state.queueCounts.append(count)
+            case .droppedJob: state.droppedJobs += 1
+            default: state.unexpectedEvents += 1
+            }
+        }
+    }
+}
+
+func checkDiagnosticsReflectQueueMutationsSynchronously() async throws {
+    let diagnostics = Task10DiagnosticRecorder()
+    let rig = try await task10MakeRig(onDiagnostic: diagnostics.record)
+    try task10Require(diagnostics.queueCounts == [0], "start did not synchronously report the empty queue")
+    for _ in 0..<7 { await rig.scheduler.submit(task10Segment()) }
+    try await task10Eventually("diagnostic fixture did not reach AI concurrency") { await rig.ai.receivedJobs.count == 2 }
+    try task10Require(diagnostics.queueCounts.last == 4, "submission returned without reporting four pending jobs")
+    try task10Require(diagnostics.droppedJobs == 1, "queue overflow did not synchronously report exactly one dropped job")
+    try task10Require(diagnostics.queueCounts.allSatisfy { (0...RuntimePolicy.pendingTranslationLimit).contains($0) },
+                      "diagnostics reported an out-of-bounds waiting queue")
+    let first = await rig.ai.receivedJobs[0]
+    await rig.ai.succeed(first)
+    try await task10Eventually("finishing a job did not start a queued job") { await rig.ai.receivedJobs.count == 3 }
+    try task10Require(diagnostics.queueCounts.last == 3, "dequeue did not report the remaining pending count")
+    await task10Stop(rig)
+    try task10Require(diagnostics.queueCounts.last == 0, "stop returned before the waiting queue reported zero")
+    try task10Require(diagnostics.unexpectedEvents == 0, "scheduler diagnostic hook emitted unrelated event types")
+}
+
+func checkDiagnosticsReportClearedQueueForModeAndFailure() async throws {
+    let diagnostics = Task10DiagnosticRecorder()
+    let rig = try await task10MakeRig(onDiagnostic: diagnostics.record)
+    for _ in 0..<6 { await rig.scheduler.submit(task10Segment()) }
+    let localIdentity = task10Identity(sessionID: rig.identity.sessionID, engineEpoch: 3)
+    try await rig.scheduler.setMode(.local, identity: localIdentity,
+                                    config: task10Config(mode: .local, profileID: rig.profile.id), profile: nil)
+    try task10Require(diagnostics.queueCounts.last == 0, "mode change did not report its cleared queue")
+    for _ in 0..<5 { await rig.scheduler.submit(task10Segment()) }
+    try await task10Eventually("local diagnostic fixture did not start") { await rig.local.receivedJobs.count == 1 }
+    try task10Require(diagnostics.queueCounts.last == 4, "local pending queue was not reported")
+    await rig.local.fail(await rig.local.receivedJobs[0], reason: .localTranslationFailed)
+    try await task10Eventually("local failure was not processed") { await task10Failed(rig.collector.events).count == 1 }
+    try task10Require(diagnostics.queueCounts.last == 0, "local failure did not report the cleared queue")
+    let beforeStop = diagnostics.queueCounts.count
+    await task10Stop(rig)
+    try task10Require(diagnostics.queueCounts.count == beforeStop + 1 && diagnostics.queueCounts.last == 0,
+                      "stopping an empty queue did not publish a final zero")
+    try task10Require(diagnostics.queueCounts.allSatisfy { (0...RuntimePolicy.pendingTranslationLimit).contains($0) },
+                      "mode/failure diagnostics exceeded the queue limit")
 }
 
 func checkConcurrencyAndQueueBounds() async throws {
@@ -496,6 +564,8 @@ private struct Task10HostChecks {
             print("output control check passed")
             return
         }
+        try await checkDiagnosticsReflectQueueMutationsSynchronously()
+        try await checkDiagnosticsReportClearedQueueForModeAndFailure()
         try await checkConcurrencyAndQueueBounds()
         try await checkDeadlineIncludesQueueTime()
         try await checkStaleErrorAndCancellationDoNotFallback()
@@ -512,11 +582,13 @@ private struct Task10HostChecks {
         try await checkFallbackCandidateRevalidated()
         try await checkQueueOverflowAtDeadline()
         try await checkOutputControlSaturationIsExplicit()
-        print("16 TASK-10 host checks passed; no SDK/device behavior tested.")
+        print("18 TASK-10 host checks passed; no SDK/device behavior tested.")
     }
 }
 #else
 struct TranslationSchedulerTests {
+    @Test func diagnosticsReflectQueueMutationsSynchronously() async throws { try await checkDiagnosticsReflectQueueMutationsSynchronously() }
+    @Test func diagnosticsReportClearedQueueForModeAndFailure() async throws { try await checkDiagnosticsReportClearedQueueForModeAndFailure() }
     @Test func testConcurrencyAndQueueBounds() async throws { try await checkConcurrencyAndQueueBounds() }
     @Test func testDeadlineIncludesQueueTime() async throws { try await checkDeadlineIncludesQueueTime() }
     @Test func testStaleErrorAndCancellationDoNotFallback() async throws {

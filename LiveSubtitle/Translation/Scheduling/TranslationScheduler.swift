@@ -50,6 +50,8 @@ actor TranslationScheduler: TranslationScheduling {
     private let aiTranslator: any Translator
     private let localTranslator: any Translator
     private let clock: any MonotonicClock
+    // Invoked synchronously without locks or unstructured delivery tasks.
+    private let onDiagnostic: (@Sendable (DiagnosticEvent) -> Void)?
 
     private var lifecycle: UInt64 = 0
     private var accepting = false
@@ -59,7 +61,13 @@ actor TranslationScheduler: TranslationScheduling {
     private var profile: CloudProfile?
     private var output: SchedulingEventOutput?
 
-    private var queue = TranslationJobQueue()
+    private var queue = TranslationJobQueue() {
+        didSet {
+            if queue.count != oldValue.count {
+                onDiagnostic?(.translationQueued(count: queue.count))
+            }
+        }
+    }
     private var jobs: [UUID: JobState] = [:]
     private var running: [UUID: RunningJob] = [:]
     private var submissions: [UUID: Submission] = [:]
@@ -75,11 +83,13 @@ actor TranslationScheduler: TranslationScheduling {
     init(
         aiTranslator: any Translator,
         localTranslator: any Translator,
-        clock: any MonotonicClock = SchedulingSystemClock()
+        clock: any MonotonicClock = SchedulingSystemClock(),
+        onDiagnostic: (@Sendable (DiagnosticEvent) -> Void)? = nil
     ) {
         self.aiTranslator = aiTranslator
         self.localTranslator = localTranslator
         self.clock = clock
+        self.onDiagnostic = onDiagnostic
     }
 
     func start(
@@ -225,8 +235,14 @@ actor TranslationScheduler: TranslationScheduling {
         return lifecycle
     }
 
-    private func clearGeneration() async {
+    private func clearQueue() {
+        let wasEmpty = queue.count == 0
         _ = queue.removeAll()
+        if wasEmpty { onDiagnostic?(.translationQueued(count: 0)) }
+    }
+
+    private func clearGeneration() async {
+        clearQueue()
         jobs.removeAll()
         submissions.removeAll()
         aiUsage.removeAll()
@@ -458,7 +474,7 @@ actor TranslationScheduler: TranslationScheduling {
             running[job.jobID]?.task.cancel()
         } else {
             accepting = false
-            _ = queue.removeAll()
+            clearQueue()
             for other in jobs.values.map(\.job) {
                 retire(other.jobID)
                 running[other.jobID]?.task.cancel()
@@ -541,6 +557,7 @@ actor TranslationScheduler: TranslationScheduling {
     }
 
     private func emit(_ event: SchedulingEvent) {
+        if case .dropped = event { onDiagnostic?(.droppedJob) }
         guard let output else { return }
         if output.emit(event) { return }
         closeAfterOutputOverload(event, output: output)
@@ -549,7 +566,7 @@ actor TranslationScheduler: TranslationScheduling {
     private func closeAfterOutputOverload(_ event: SchedulingEvent, output: SchedulingEventOutput) {
         guard accepting else { return }
         accepting = false
-        _ = queue.removeAll()
+        clearQueue()
         let currentJobs = jobs.values.map(\.job)
         for job in currentJobs {
             retire(job.jobID)
