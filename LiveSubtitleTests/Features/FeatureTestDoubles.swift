@@ -348,6 +348,8 @@ actor FeatureConnectionTesterDouble: ConnectionTesting {
 
 actor FeatureCapabilityDouble: CapabilityChecking {
     private var report: CapabilityReport
+    private var checkContinuation: CheckedContinuation<Void, Never>?
+    private var shouldSuspendCheck = false
     private(set) var checkedConfigs: [SessionConfig] = []
 
     init(report: CapabilityReport) {
@@ -356,10 +358,19 @@ actor FeatureCapabilityDouble: CapabilityChecking {
 
     func check(config: SessionConfig) async -> CapabilityReport {
         checkedConfigs.append(config)
+        if shouldSuspendCheck {
+            shouldSuspendCheck = false
+            await withCheckedContinuation { checkContinuation = $0 }
+        }
         return report
     }
 
     func setReport(_ report: CapabilityReport) { self.report = report }
+    func suspendNextCheck() { shouldSuspendCheck = true }
+    func releaseCheck() {
+        checkContinuation?.resume()
+        checkContinuation = nil
+    }
 }
 
 @MainActor

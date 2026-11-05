@@ -96,6 +96,51 @@ func testInitialSetupAndResources() async throws {
     try featureRequire(await blockedRig.session.preparedConfigs.isEmpty, "AI started without local fallback resources")
 }
 
+@MainActor
+func testDefaultLanguagesResolveToRegionalCandidates() async throws {
+    let ready = LanguageAssetStatus(recognition: .ready, localTranslation: .ready)
+    let rig = FeatureTestRig(capabilityReport: CapabilityReport(
+        sourceLanguages: [LanguageIdentifier(rawValue: "en_GB"), LanguageIdentifier(rawValue: "en_US")],
+        targetLanguages: [LanguageIdentifier(rawValue: "zh_Hant_TW"), LanguageIdentifier(rawValue: "zh_Hans_CN")],
+        assets: ready, blockers: []
+    ))
+    let setup = rig.makeSetupViewModel()
+    await setup.load()
+    try featureRequire(setup.sourceLanguage.rawValue == "en_US", "English default did not resolve to the SDK regional candidate")
+    try featureRequire(setup.targetLanguage.rawValue == "zh_Hans_CN", "Simplified Chinese default did not retain its script when resolving")
+    try featureRequire(setup.availableSourceLanguages.contains(setup.sourceLanguage), "resolved source has no Picker tag")
+    try featureRequire(setup.availableTargetLanguages.contains(setup.targetLanguage), "resolved target has no Picker tag")
+    let configs = await rig.capability.checkedConfigs
+    try featureRequire(configs.last?.sourceLanguage.rawValue == "en_US" && configs.last?.targetLanguage.rawValue == "zh_Hans_CN",
+                       "resource status was not rechecked for the resolved language pair")
+}
+
+@MainActor
+func testLanguagePickerRetainsSelectionWhileCapabilitiesLoad() async throws {
+    let rig = FeatureTestRig(preferences: makeFeaturePreferences(source: "en-GB", target: "zh-Hant"), capabilityReport: CapabilityReport(
+        sourceLanguages: [LanguageIdentifier(rawValue: "en_US")],
+        targetLanguages: [LanguageIdentifier(rawValue: "zh_Hans_CN")],
+        assets: LanguageAssetStatus(recognition: .unsupported, localTranslation: .unsupported),
+        blockers: [.unsupportedLanguage]
+    ))
+    let setup = rig.makeSetupViewModel()
+    await rig.capability.suspendNextCheck()
+    let loading = Task { await setup.load() }
+    try await featureEventually("capability load did not suspend") { await rig.capability.checkedConfigs.count == 1 }
+    try featureRequire(setup.availableSourceLanguages.contains(setup.sourceLanguage), "stored source has no Picker tag while capabilities load")
+    try featureRequire(setup.availableTargetLanguages.contains(setup.targetLanguage), "stored target has no Picker tag while capabilities load")
+    await rig.capability.releaseCheck()
+    await loading.value
+    try featureRequire(setup.sourceLanguage.rawValue == "en-GB", "unavailable regional selection silently changed to a supported region")
+    try featureRequire(setup.targetLanguage.rawValue == "zh-Hant", "Traditional Chinese silently changed script")
+    try featureRequire(setup.availableSourceLanguages.contains(setup.sourceLanguage), "unavailable source has no Picker tag")
+    try featureRequire(setup.availableTargetLanguages.contains(setup.targetLanguage), "unavailable target has no Picker tag")
+    setup.start()
+    try await featureMainActorEventually("unsupported pair did not finish checking") { !setup.isPreparing }
+    try featureRequire(await rig.session.preparedConfigs.isEmpty, "unsupported retained selection started a session")
+    try featureRequire(setup.assetStatus.recognition == .unsupported, "retained Picker selection was treated as supported")
+}
+
 func featureUnwrapConfig(_ session: FeatureSessionDouble) async throws -> SessionConfig {
     guard let config = await session.preparedConfigs.first else {
         throw FeatureTestFailure(message: "missing prepared config")
@@ -212,6 +257,8 @@ private struct FeaturesHostChecks {
     static func main() async throws {
         let checks: [(String, @MainActor () async throws -> Void)] = [
             ("testInitialSetupAndResources", testInitialSetupAndResources),
+            ("testDefaultLanguagesResolveToRegionalCandidates", testDefaultLanguagesResolveToRegionalCandidates),
+            ("testLanguagePickerRetainsSelectionWhileCapabilitiesLoad", testLanguagePickerRetainsSelectionWhileCapabilitiesLoad),
             ("testCancelledPreparationNeverStartsCapture", testCancelledPreparationNeverStartsCapture),
             ("testCloudSaveIsNotEnableAI", testCloudSaveIsNotEnableAI),
             ("testCloudMutationOrder", testCloudMutationOrder),
@@ -249,6 +296,8 @@ private struct FeaturesHostChecks {
 }
 #else
 struct SetupViewModelTests {
+    @Test @MainActor func defaultLanguagesResolveToRegionalCandidates() async throws { try await testDefaultLanguagesResolveToRegionalCandidates() }
+    @Test @MainActor func languagePickerRetainsSelectionWhileCapabilitiesLoad() async throws { try await testLanguagePickerRetainsSelectionWhileCapabilitiesLoad() }
     @Test @MainActor func initialSetupAndResources() async throws { try await testInitialSetupAndResources() }
     @Test @MainActor func cancelledPreparationNeverStartsCapture() async throws { try await testCancelledPreparationNeverStartsCapture() }
     @Test @MainActor func displayOnlyUpdate() async throws { try await testDisplayOnlyUpdate() }

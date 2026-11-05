@@ -6,8 +6,18 @@ final class SetupViewModel: ObservableObject {
     @Published private(set) var sourceLanguage = LanguageIdentifier(rawValue: "en")
     @Published private(set) var targetLanguage = LanguageIdentifier(rawValue: "zh-Hans")
     @Published private(set) var requestedMode: RequestedMode = .local
-    @Published private(set) var availableSourceLanguages = [LanguageIdentifier(rawValue: "en")]
-    @Published private(set) var availableTargetLanguages = [LanguageIdentifier(rawValue: "zh-Hans")]
+    @Published private(set) var sourceLanguageCandidates: [LanguageIdentifier] = []
+    @Published private(set) var targetLanguageCandidates: [LanguageIdentifier] = []
+    @Published private(set) var hasLoadedCapabilities = false
+
+    // A retained selection is a Picker tag, not evidence of device support.
+    var availableSourceLanguages: [LanguageIdentifier] {
+        sourceLanguageCandidates.contains(sourceLanguage) ? sourceLanguageCandidates : [sourceLanguage] + sourceLanguageCandidates
+    }
+
+    var availableTargetLanguages: [LanguageIdentifier] {
+        targetLanguageCandidates.contains(targetLanguage) ? targetLanguageCandidates : [targetLanguage] + targetLanguageCandidates
+    }
     @Published private(set) var assetStatus = LanguageAssetStatus(recognition: .missing, localTranslation: .missing)
     @Published private(set) var display = DisplayPreferences(displayCount: RuntimePolicy.defaultDisplayCount, displayStyle: .bilingual)
     @Published private(set) var sessionStatus: SessionStatus?
@@ -310,13 +320,37 @@ final class SetupViewModel: ObservableObject {
     }
 
     private func reloadCapabilities() async {
-        let report = await capability.check(config: currentConfig)
+        let generation = configurationGeneration
+        var report = await capability.check(config: currentConfig)
+        guard isCurrent(generation) else { return }
+        let resolvedSource = equivalentCandidate(for: sourceLanguage, in: report.sourceLanguages)
+        let resolvedTarget = equivalentCandidate(for: targetLanguage, in: report.targetLanguages)
+        if resolvedSource != sourceLanguage || resolvedTarget != targetLanguage {
+            sourceLanguage = resolvedSource
+            targetLanguage = resolvedTarget
+            report = await capability.check(config: currentConfig)
+            guard isCurrent(generation) else { return }
+        }
         apply(report)
     }
 
+    private func equivalentCandidate(
+        for selection: LanguageIdentifier,
+        in candidates: [LanguageIdentifier]
+    ) -> LanguageIdentifier {
+        if candidates.contains(selection) { return selection }
+        // Maximization reconciles SDK locale spellings/default regions without
+        // dropping an explicit script or region from the user's selection.
+        let identifier = Locale.Language(identifier: selection.rawValue).maximalIdentifier
+        return candidates.first {
+            Locale.Language(identifier: $0.rawValue).maximalIdentifier == identifier
+        } ?? selection
+    }
+
     private func apply(_ report: CapabilityReport) {
-        availableSourceLanguages = report.sourceLanguages.isEmpty ? [sourceLanguage] : report.sourceLanguages
-        availableTargetLanguages = report.targetLanguages.isEmpty ? [targetLanguage] : report.targetLanguages
+        sourceLanguageCandidates = report.sourceLanguages
+        targetLanguageCandidates = report.targetLanguages
+        hasLoadedCapabilities = true
         assetStatus = report.assets
     }
 

@@ -13,12 +13,12 @@ struct SetupView: View {
                 Section("语言") {
                     Picker("源语言", selection: sourceBinding) {
                         ForEach(viewModel.availableSourceLanguages, id: \.self) { language in
-                            Text(language.featureDisplayName).tag(language)
+                            Text(languageLabel(language, candidates: viewModel.sourceLanguageCandidates)).tag(language)
                         }
                     }
                     Picker("目标语言", selection: targetBinding) {
                         ForEach(viewModel.availableTargetLanguages, id: \.self) { language in
-                            Text(language.featureDisplayName).tag(language)
+                            Text(languageLabel(language, candidates: viewModel.targetLanguageCandidates)).tag(language)
                         }
                     }
                 }
@@ -83,6 +83,12 @@ struct SetupView: View {
             .navigationTitle("实时字幕")
             .task { await viewModel.load() }
         }
+    }
+
+    private func languageLabel(_ language: LanguageIdentifier, candidates: [LanguageIdentifier]) -> String {
+        guard !candidates.contains(language) else { return language.featureDisplayName }
+        let notice = viewModel.hasLoadedCapabilities ? "当前不可用" : "待检查"
+        return "\(language.featureDisplayName)（\(notice)）"
     }
 
     private var sourceBinding: Binding<LanguageIdentifier> {

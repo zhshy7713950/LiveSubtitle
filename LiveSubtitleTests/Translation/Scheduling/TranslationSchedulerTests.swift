@@ -417,6 +417,9 @@ func checkQueueOverflowAtDeadline() async throws {
     try task10Require(await !task10Dropped(rig.collector.events).contains {
         $0.segmentID == segments[2].segmentID
     }, "expired current job was reported as dropped instead of timeout")
+    try await task10Eventually("deadline overflow fallback was not consumed") {
+        await !task10Fallbacks(rig.collector.events).isEmpty
+    }
     try task10Require(await task10Fallbacks(rig.collector.events).count == 1,
                       "deadline overflow did not produce exactly one fallback")
     await task10Stop(rig)
